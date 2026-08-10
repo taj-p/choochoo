@@ -1,0 +1,10 @@
+---
+source: src/render.rs
+expression: "render_table(&t, Some(\"a\"))"
+---
+| # | Title | PR |   |
+|---|-------|----|---|
+| 1 | `a` | #10 | **this PR** |
+| 2 | `b` | #11 |  |
+| 3 | `c` | — |  |
+| Σ | Combined: feat | #12 |  |
