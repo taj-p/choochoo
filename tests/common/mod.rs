@@ -221,6 +221,20 @@ impl TestRepo {
         self
     }
 
+    /// Write `toml` as this machine's whole config file and use it.
+    ///
+    /// The counterpart to [`TestRepo::share_state`] for config that isn't
+    /// about the store — it still lands inside this test's sandboxed
+    /// `XDG_CONFIG_HOME`, never the developer's real one.
+    pub fn set_config(&mut self, toml: &str) -> &Self {
+        let dir = self.env.path().join("xdg-config").join("choochoo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, toml).unwrap();
+        self.config = config;
+        self
+    }
+
     /// Point shared state at a path that isn't a git repo.
     pub fn share_state_with_url(&mut self, url: &str) -> &Self {
         let dir = self.env.path().join("xdg-config").join("choochoo");

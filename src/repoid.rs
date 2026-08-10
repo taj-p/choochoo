@@ -65,6 +65,31 @@ pub fn from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Normalize a repository as *written by hand in config.toml* into the same
+/// key [`from_url`] derives from a git remote.
+///
+/// Config is typed by a person, so it accepts whichever spelling they have to
+/// hand: the address bar (`https://github.com/Canva/canva`), what `git remote
+/// -v` prints (`git@github.com:Canva/canva.git`), or the bare key itself
+/// (`github.com/canva/canva`). Only that last form needs help — with no
+/// scheme and no colon, [`from_url`] would read it as a local directory — so
+/// it gets an `https://` prefix and goes through the same path as everything
+/// else. A leading `/` or `.` marks a genuine local path and is left alone.
+///
+/// Returns [`None`] only when there is nothing usable in `spec` at all.
+pub fn from_config_key(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    let bare_host_path = !spec.contains("://")
+        && !spec.contains(':')
+        && !spec.starts_with('/')
+        && !spec.starts_with('.')
+        && spec.contains('/');
+    if bare_host_path {
+        return from_url(&format!("https://{spec}"));
+    }
+    from_url(spec)
+}
+
 /// True when `key` is safe to use as a relative path inside the store repo.
 ///
 /// Guards the path join in the store backend: a key is attacker-adjacent
@@ -321,6 +346,47 @@ mod tests {
     fn windows_drive_path_is_local() {
         let k = key("C:\\repos\\thing");
         assert!(k.starts_with("local/"), "got {k}");
+    }
+
+    /// Every spelling someone might reasonably write in config.toml has to
+    /// land on the key the `origin` URL produces, or their `[repo]` entry
+    /// silently does nothing.
+    #[test]
+    fn config_keys_agree_with_remote_urls() {
+        let expected = key("git@github.com:Canva/canva.git");
+        assert_eq!(expected, "github.com/canva/canva");
+        for spelling in [
+            "https://github.com/Canva/canva",
+            "https://github.com/Canva/canva.git",
+            "https://github.com/canva/canva/",
+            "git@github.com:Canva/canva.git",
+            "ssh://git@github.com/canva/canva.git",
+            "github.com/Canva/canva",
+            "github.com/canva/canva",
+        ] {
+            assert_eq!(
+                from_config_key(spelling).as_deref(),
+                Some(expected.as_str()),
+                "config key {spelling:?} did not match the remote URL"
+            );
+        }
+    }
+
+    /// A bare local path in config is a local path, not a `host/owner/repo`
+    /// that happens to start with a slash — and it must agree with the same
+    /// path read back out of `git remote get-url`.
+    #[test]
+    fn config_keys_agree_for_local_paths() {
+        for path in ["/tmp/xyz/bare.git", "../sibling.git", "./sibling.git"] {
+            assert_eq!(from_config_key(path).as_deref(), Some(key(path).as_str()));
+        }
+        assert!(from_config_key("/tmp/xyz/bare.git").unwrap().starts_with("local/"));
+    }
+
+    #[test]
+    fn empty_config_key_has_no_key() {
+        assert_eq!(from_config_key(""), None);
+        assert_eq!(from_config_key("   "), None);
     }
 
     #[test]

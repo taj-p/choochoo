@@ -1,14 +1,27 @@
 //! User configuration: `~/.config/choochoo/config.toml`.
 //!
 //! choochoo works with no config file at all — that's the historical
-//! local-only behaviour. A config file exists to say where train state
-//! should live when you want it shared between machines:
+//! local-only behaviour. A config file says where train state should live
+//! when you want it shared between machines, and carries any per-repository
+//! settings:
 //!
 //! ```toml
 //! [store]
 //! repo = "git@github.com:you/choochoo-state.git"
 //! branch = "main"   # optional
+//!
+//! [repo."https://github.com/Canva/canva"]
+//! base = "master"
 //! ```
+//!
+//! ## Why `[repo]` keys are normalized
+//!
+//! A person writing config has a URL to hand, not choochoo's internal
+//! identity for their repo — and which URL depends on where they copied it
+//! from. So every key goes through [`crate::repoid::from_config_key`] at
+//! parse time and ends up as the same `host/owner/repo` string the `origin`
+//! URL resolves to. Writing the address-bar URL, the `git remote -v` URL, or
+//! the bare key all work and all mean the same repository.
 //!
 //! ## Why the paths are resolved by hand
 //!
@@ -29,6 +42,7 @@
 //! and it means a unit test physically cannot read the developer's real
 //! config.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +55,10 @@ use crate::error::{Error, Result};
 /// local-only". Spelled out rather than using the empty string so it reads
 /// clearly in a shell: `CHOOCHOO_CONFIG=none choo list`.
 pub const CONFIG_NONE: &str = "none";
+
+/// Base branch a new train sits on when nothing else says otherwise —
+/// no `--base`, and no `[repo."..."] base` for this repository.
+pub const DEFAULT_BASE: &str = "main";
 
 /// Every environment input the config layer needs, captured in one place.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -164,12 +182,13 @@ pub fn load_from(path: &Path) -> Result<Config> {
 /// Parse config TOML. Split out from [`load_from`] so it can be tested
 /// without touching the filesystem.
 pub fn parse(text: &str, path: &Path) -> Result<Config> {
-    let config: Config = toml::from_str(text).map_err(|e| Error::Config {
+    let mut config: Config = toml::from_str(text).map_err(|e| Error::Config {
         path: path.to_path_buf(),
         // `toml`'s Display already includes the line/column and a snippet;
         // trim the trailing newline so it sits on our one-line message.
         reason: e.to_string().trim_end().to_string(),
     })?;
+    config.normalize_repo_keys(path)?;
     config.validate(path)?;
     Ok(config)
 }
@@ -181,6 +200,26 @@ pub struct Config {
     /// Absent means local-only: state stays in `.git/choochoo/state.json`.
     #[serde(default)]
     pub store: Option<StoreConfig>,
+    /// Per-repository settings from `[repo."<url>"]` tables.
+    ///
+    /// Keyed by [`crate::repoid`] identity, *not* by the spelling in the
+    /// file — see the module docs. Empty is the common case and costs
+    /// nothing: no `[repo]` table means no git call to identify the repo.
+    #[serde(default, rename = "repo")]
+    pub repos: BTreeMap<String, RepoConfig>,
+}
+
+/// A `[repo."<url>"]` table: settings that apply only to one repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoConfig {
+    /// Base branch `choo init` uses here when `--base` is not given.
+    ///
+    /// This is a *default for new trains*, not a property of the repo:
+    /// changing it never moves a train that already exists, since each
+    /// train records the base it was created with.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 /// The `[store]` table: a git repo that holds choochoo's train metadata.
@@ -199,6 +238,43 @@ fn default_branch() -> String {
 }
 
 impl Config {
+    /// Rewrite `[repo."..."]` keys from whatever the user typed into the
+    /// identity [`crate::repoid::from_url`] derives from a remote.
+    ///
+    /// Two spellings of one repository is a hard error rather than a
+    /// last-one-wins merge: the file would read as though both entries
+    /// applied, and the one being ignored is exactly the sort of thing
+    /// someone would spend an afternoon on.
+    fn normalize_repo_keys(&mut self, path: &Path) -> Result<()> {
+        if self.repos.is_empty() {
+            return Ok(());
+        }
+        let bad = |reason: String| Error::Config {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let mut normalized = BTreeMap::new();
+        let mut spellings: BTreeMap<String, String> = BTreeMap::new();
+        for (spelling, repo) in std::mem::take(&mut self.repos) {
+            let key = crate::repoid::from_config_key(&spelling).ok_or_else(|| {
+                bad(format!(
+                    "`[repo.\"{spelling}\"]` is not a repository URL; use the \
+                     URL of the repo's `origin`, e.g. \
+                     `[repo.\"https://github.com/owner/name\"]`"
+                ))
+            })?;
+            if let Some(previous) = spellings.insert(key.clone(), spelling.clone()) {
+                return Err(bad(format!(
+                    "`[repo.\"{previous}\"]` and `[repo.\"{spelling}\"]` are the \
+                     same repository (`{key}`); keep one of them"
+                )));
+            }
+            normalized.insert(key, repo);
+        }
+        self.repos = normalized;
+        Ok(())
+    }
+
     fn validate(&self, path: &Path) -> Result<()> {
         if let Some(store) = &self.store {
             if store.repo.trim().is_empty() {
@@ -214,7 +290,22 @@ impl Config {
                 });
             }
         }
+        for (key, repo) in &self.repos {
+            if repo.base.as_ref().is_some_and(|b| b.trim().is_empty()) {
+                return Err(Error::Config {
+                    path: path.to_path_buf(),
+                    reason: format!("`repo.\"{key}\".base` cannot be empty"),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Configured base branch for the repository identified by `key`, if the
+    /// user set one. `key` comes from [`crate::repoid`], so it is already in
+    /// the same normalized form as the map.
+    pub fn base_for(&self, key: &str) -> Option<&str> {
+        self.repos.get(key)?.base.as_deref()
     }
 
     /// The configured store, if any.
@@ -375,6 +466,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.store.unwrap().branch, "trains");
+    }
+
+    #[test]
+    fn repo_base_is_keyed_by_repo_identity() {
+        let c = parse(
+            "[repo.\"https://github.com/Canva/canva\"]\nbase = \"master\"\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(c.base_for("github.com/canva/canva"), Some("master"));
+        assert_eq!(c.base_for("github.com/canva/other"), None);
+    }
+
+    /// The point of normalizing: it doesn't matter which URL the user had to
+    /// hand, only which repo it names.
+    #[test]
+    fn every_url_spelling_reaches_the_same_repo() {
+        for spelling in [
+            "https://github.com/Canva/canva",
+            "https://github.com/canva/canva.git",
+            "git@github.com:Canva/canva.git",
+            "github.com/canva/canva",
+        ] {
+            let c = parse(&format!("[repo.\"{spelling}\"]\nbase = \"master\"\n"), &p())
+                .unwrap();
+            assert_eq!(
+                c.base_for("github.com/canva/canva"),
+                Some("master"),
+                "{spelling} did not resolve"
+            );
+        }
+    }
+
+    /// Two spellings of one repo means one of them is silently dead. Say so.
+    #[test]
+    fn duplicate_repo_spellings_are_rejected() {
+        let err = parse(
+            "[repo.\"https://github.com/Canva/canva\"]\nbase = \"master\"\n\
+             [repo.\"git@github.com:canva/canva.git\"]\nbase = \"main\"\n",
+            &p(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("same repository"), "got: {msg}");
+        assert!(msg.contains("github.com/canva/canva"), "got: {msg}");
+    }
+
+    #[test]
+    fn repo_table_without_base_is_allowed() {
+        let c = parse("[repo.\"github.com/o/r\"]\n", &p()).unwrap();
+        assert_eq!(c.base_for("github.com/o/r"), None);
+        assert!(c.repos.contains_key("github.com/o/r"));
+    }
+
+    #[test]
+    fn blank_repo_base_is_rejected() {
+        assert!(matches!(
+            parse("[repo.\"github.com/o/r\"]\nbase = \" \"\n", &p()),
+            Err(Error::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn unusable_repo_key_is_rejected() {
+        let err = parse("[repo.\"\"]\nbase = \"master\"\n", &p()).unwrap_err();
+        assert!(matches!(err, Error::Config { .. }));
+        assert!(err.to_string().contains("repository URL"), "{err}");
+    }
+
+    #[test]
+    fn unknown_repo_key_is_rejected() {
+        assert!(matches!(
+            parse("[repo.\"github.com/o/r\"]\nbase0 = \"master\"\n", &p()),
+            Err(Error::Config { .. })
+        ));
+    }
+
+    /// `[repo]` and `[store]` are independent: per-repo settings must work
+    /// for someone who has never turned on shared state.
+    #[test]
+    fn repo_settings_work_without_a_store() {
+        let c = parse("[repo.\"github.com/o/r\"]\nbase = \"master\"\n", &p()).unwrap();
+        assert!(c.store().is_none());
+        assert_eq!(c.base_for("github.com/o/r"), Some("master"));
+    }
+
+    #[test]
+    fn no_repo_table_means_no_per_repo_settings() {
+        let c = parse("[store]\nrepo = \"u\"\n", &p()).unwrap();
+        assert!(c.repos.is_empty());
+        assert_eq!(c.base_for("github.com/o/r"), None);
     }
 
     /// A typo that silently left sync switched off would look exactly like

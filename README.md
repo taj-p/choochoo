@@ -40,8 +40,9 @@ cargo build --release
 from your existing `gh auth login`.
 
 Configuration is optional and lives at `~/.config/choochoo/config.toml`
-(`$XDG_CONFIG_HOME` is honoured; the path is the same on macOS and Linux).
-Its only job is [sharing state across machines](#sharing-state-across-machines).
+(`$XDG_CONFIG_HOME` is honoured; the path is the same on macOS and Linux). It
+covers [sharing state across machines](#sharing-state-across-machines) and
+[per-repository settings](#per-repository-settings).
 
 ## Quickstart
 
@@ -99,7 +100,7 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 
 | Command | What it does |
 |---|---|
-| `choo init <name> [--base main] [--aggregate] [--aggregate-branch <b>]` | Create a new (empty) train. `--aggregate` also manages a combined branch (default name `choo/<name>/combined`). |
+| `choo init <name> [--base <branch>] [--aggregate] [--aggregate-branch <b>]` | Create a new (empty) train. `--base` defaults to this repo's [configured base](#per-repository-settings), else `main`. `--aggregate` also manages a combined branch (default name `choo/<name>/combined`). |
 | `choo list` | List every train in this repo. |
 | `choo show [<name>]` | Show a train's branches and PRs. |
 | `choo switch <name>` | Set the active train. |
@@ -218,6 +219,38 @@ one above.
 If the store is genuinely unreachable and there's no clone yet, that's an
 error rather than a silent fallback — quietly showing you an empty list of
 trains would be worse.
+
+## Per-repository settings
+
+Not every repo's trunk is called `main`. A `[repo."<url>"]` table sets the
+base branch `choo init` picks in one repository, so you don't retype `--base`
+for every train:
+
+```toml
+[repo."https://github.com/Canva/canva"]
+base = "master"
+
+[repo."git@github.com:you/side-project.git"]
+base = "trunk"
+```
+
+The table key is matched by *which repository it names*, not by the exact
+string: choochoo normalizes both the key and your `origin` URL to
+`host/owner/name`. All of these mean the same repo, so use whichever you have
+to hand:
+
+```
+https://github.com/Canva/canva      github.com/Canva/canva
+https://github.com/Canva/canva.git  git@github.com:Canva/canva.git
+```
+
+Precedence for a new train's base is `--base` > `[repo."..."] base` > `main`.
+It only ever affects trains created from then on — each train records the base
+it was created with, so editing config never re-points a train that already
+exists. A repo with no `origin`, or one with no entry, gets `main` as before.
+
+Listing one repository twice under two spellings is an error rather than
+last-one-wins: one of the two entries would be silently dead.
 
 ## Mental model
 

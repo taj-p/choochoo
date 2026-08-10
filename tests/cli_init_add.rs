@@ -2,7 +2,7 @@
 //! `choo show`, `choo switch`.
 
 mod common;
-use common::TestRepo;
+use common::{BareRepo, TestRepo};
 use predicates::prelude::*;
 
 #[test]
@@ -10,6 +10,95 @@ fn list_with_no_trains_says_so() {
     let repo = TestRepo::new();
     let out = repo.choo_ok(["list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("no trains"));
+}
+
+#[test]
+fn init_defaults_to_main_with_no_config() {
+    let repo = TestRepo::new();
+    repo.choo_ok(["init", "feat"]);
+    let out = repo.choo_ok(["list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("base=main"));
+}
+
+/// The per-repo setting someone configures for a repo whose trunk isn't
+/// `main`: `choo init` with no `--base` has to pick it up.
+#[test]
+fn init_uses_the_base_configured_for_this_repo() {
+    let origin = BareRepo::new();
+    let mut repo = TestRepo::new();
+    repo.with_origin(&origin);
+    repo.set_config(&format!(
+        "[repo.\"{}\"]\nbase = \"master\"\n",
+        origin.url()
+    ));
+
+    repo.choo_ok(["init", "feat"]);
+    let out = repo.choo_ok(["list"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("base=master"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn explicit_base_flag_beats_the_configured_one() {
+    let origin = BareRepo::new();
+    let mut repo = TestRepo::new();
+    repo.with_origin(&origin);
+    repo.set_config(&format!(
+        "[repo.\"{}\"]\nbase = \"master\"\n",
+        origin.url()
+    ));
+
+    repo.choo_ok(["init", "feat", "--base", "develop"]);
+    let out = repo.choo_ok(["list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("base=develop"));
+}
+
+/// An entry for someone else's repo must not leak into this one.
+#[test]
+fn config_for_another_repo_does_not_apply() {
+    let origin = BareRepo::new();
+    let mut repo = TestRepo::new();
+    repo.with_origin(&origin);
+    repo.set_config(
+        "[repo.\"https://github.com/someone/else\"]\nbase = \"master\"\n",
+    );
+
+    repo.choo_ok(["init", "feat"]);
+    let out = repo.choo_ok(["list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("base=main"));
+}
+
+/// A configured repo you happen to be working in without an `origin` is not
+/// an error — it just can't be identified, so the default stands.
+#[test]
+fn a_repo_with_no_origin_still_inits() {
+    let mut repo = TestRepo::new();
+    repo.set_config(
+        "[repo.\"https://github.com/Canva/canva\"]\nbase = \"master\"\n",
+    );
+
+    repo.choo_ok(["init", "feat"]);
+    let out = repo.choo_ok(["list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("base=main"));
+}
+
+/// Two spellings of one repo would leave one silently ignored, so the file
+/// is rejected outright rather than half-applied.
+#[test]
+fn duplicate_repo_entries_are_reported() {
+    let mut repo = TestRepo::new();
+    repo.set_config(
+        "[repo.\"https://github.com/Canva/canva\"]\nbase = \"master\"\n\
+         [repo.\"git@github.com:canva/canva.git\"]\nbase = \"main\"\n",
+    );
+
+    let out = repo.choo_try(["list"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("same repository"), "got: {stderr}");
 }
 
 #[test]

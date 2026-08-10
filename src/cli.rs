@@ -5,11 +5,12 @@
 //! (argument parsing, formatting, exit codes) live here.
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
 use crate::error::Result;
-use crate::git::{ProcessGitRunner, PushMode};
+use crate::git::{GitRunner, ProcessGitRunner, PushMode};
 use crate::github;
 use crate::report::StderrReporter;
 use crate::state::{self, Store};
@@ -33,9 +34,10 @@ pub enum Command {
     Init {
         /// Name of the train.
         name: String,
-        /// Base branch the train sits on top of.
-        #[arg(long, default_value = "main")]
-        base: String,
+        /// Base branch the train sits on top of. Defaults to this repo's
+        /// `[repo."<url>"] base` in config.toml, else `main`.
+        #[arg(long)]
+        base: Option<String>,
         /// Also manage an aggregate ("combined") branch for this train: one
         /// extra branch holding every change in the train, with its own
         /// draft PR against the base branch.
@@ -199,7 +201,7 @@ pub enum AggregateCommand {
 
 /// Entry point used by `main.rs`. Parses argv and dispatches.
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let repo_root = state::find_repo_root(&std::env::current_dir()?)?;
 
     let mut env = crate::config::Env::from_process();
@@ -216,6 +218,14 @@ pub fn run() -> Result<()> {
         Store::local(repo_root)
     };
 
+    // Resolved here rather than in `dispatch` because it's the config layer's
+    // answer, and `dispatch` deliberately takes only a store.
+    if let Command::Init { base, .. } = &mut cli.command {
+        if base.is_none() {
+            *base = Some(default_base(&config, store.repo_root()));
+        }
+    }
+
     let result = dispatch(cli, &store);
     // Surface sync degradations even when the command itself failed — the
     // reason a command failed may well be in here.
@@ -223,6 +233,28 @@ pub fn run() -> Result<()> {
         eprintln!("warning: {warning}");
     }
     result
+}
+
+/// Base branch a new train should sit on when `--base` wasn't given.
+///
+/// `[repo."<origin url>"] base` from config, else [`config::DEFAULT_BASE`].
+///
+/// Identifying the repository means asking git for its `origin` URL, so this
+/// stays entirely out of the way of anyone with no `[repo]` tables: no git
+/// process, no failure mode. When there *are* tables but the repo can't be
+/// identified — no `origin`, an unusable URL, no `git` on `PATH` — the answer
+/// is the plain default. That's indistinguishable from having no entry for
+/// this repo, which is what it means.
+fn default_base(config: &crate::config::Config, repo_root: &Path) -> String {
+    if config.repos.is_empty() {
+        return crate::config::DEFAULT_BASE.to_string();
+    }
+    ProcessGitRunner::new(repo_root.to_path_buf())
+        .ok()
+        .and_then(|git| git.remote_url("origin").ok().flatten())
+        .and_then(|url| crate::repoid::from_url(&url))
+        .and_then(|key| config.base_for(&key).map(str::to_string))
+        .unwrap_or_else(|| crate::config::DEFAULT_BASE.to_string())
 }
 
 pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
@@ -235,6 +267,10 @@ pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
             aggregate,
             aggregate_branch,
         } => {
+            // `run` has already resolved this against the config; the
+            // fallback is for anyone calling `dispatch` directly.
+            let base = base
+                .unwrap_or_else(|| crate::config::DEFAULT_BASE.to_string());
             train::init::run(store, &name, &base)?;
             writeln!(&mut out, "created train `{name}` (base `{base}`)").ok();
             if aggregate || aggregate_branch.is_some() {
