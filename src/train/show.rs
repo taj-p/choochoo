@@ -40,6 +40,7 @@ fn format_train(state: &StateFile, train: &Train) -> String {
         if active { " (active)" } else { "" }
     );
     let _ = writeln!(&mut out, "Base:  {}", train.base);
+    append_context(&mut out, train);
     if train.branches.is_empty() {
         out.push_str("(no branches yet; `choo add <branch>` to add one)\n");
         append_aggregate(&mut out, train);
@@ -56,6 +57,23 @@ fn format_train(state: &StateFile, train: &Train) -> String {
     }
     append_aggregate(&mut out, train);
     out
+}
+
+/// The PR Train Context, if the train has one, indented so a multi-line
+/// context can't be mistaken for the rest of the summary.
+fn append_context(out: &mut String, train: &Train) {
+    let Some(text) = train.context() else {
+        return;
+    };
+    out.push_str("Context:\n");
+    for line in text.lines() {
+        // Blank lines stay blank rather than becoming two spaces.
+        if line.trim().is_empty() {
+            out.push('\n');
+        } else {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
 }
 
 /// One extra line for the aggregate branch, if enabled. Mirrors the branch
@@ -165,6 +183,24 @@ mod tests {
         let out = render_show(&s, "empty").unwrap();
         assert!(out.contains("no branches yet"));
         assert!(out.contains("Combined: choo/empty/combined  [no PR]"));
+    }
+
+    #[test]
+    fn show_renders_the_context_indented() {
+        let mut s = sample_state();
+        s.train_mut("feat")
+            .unwrap()
+            .set_context("Why this stack exists.\n\nRead from the bottom.");
+        let out = render_show(&s, "feat").unwrap();
+        assert!(out.contains("Context:\n  Why this stack exists.\n"));
+        // Blank lines inside the context carry no phantom indentation.
+        assert!(out.contains("\n\n  Read from the bottom.\n"), "got: {out}");
+    }
+
+    #[test]
+    fn show_omits_the_context_line_when_there_is_none() {
+        let s = sample_state();
+        assert!(!render_show(&s, "feat").unwrap().contains("Context:"));
     }
 
     #[test]

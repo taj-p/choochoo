@@ -11,6 +11,7 @@
 pub mod add;
 pub mod aggregate;
 pub mod checkout;
+pub mod context;
 pub mod fetch;
 pub mod init;
 pub mod pr;

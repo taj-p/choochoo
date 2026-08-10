@@ -203,6 +203,19 @@ pub struct Train {
     /// unless the user enabled it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<Aggregate>,
+    /// Prose that belongs to the *train* rather than to any one PR: why
+    /// this stack exists, how to read it, what to look at first.
+    ///
+    /// choochoo renders it as a "PR Train Context" section at the top of
+    /// every PR in the train, so it is written once (`choo context`) and
+    /// pushed to every description by the next `choo pr` — rather than
+    /// copy-pasted into each one by hand.
+    ///
+    /// Stored trimmed, and [`None`] rather than `Some("")` when empty: an
+    /// empty context means "render no section at all", and there should be
+    /// only one representation of that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// The train's aggregate branch and its draft PR.
@@ -265,7 +278,30 @@ impl Train {
             prs: BTreeMap::new(),
             branch_bases: BTreeMap::new(),
             aggregate: None,
+            context: None,
         }
+    }
+
+    /// The train's PR Train Context, if it has a non-empty one.
+    pub fn context(&self) -> Option<&str> {
+        self.context.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// Replace the PR Train Context, normalising the empty case to [`None`]
+    /// so state has one representation of "no context".
+    ///
+    /// Returns whether this actually changed anything, which is what the
+    /// caller reports to the user (and what decides whether to write).
+    pub fn set_context(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        let changed = next != self.context;
+        self.context = next;
+        changed
     }
 
     /// The aggregate branch name, if the aggregate branch is enabled.

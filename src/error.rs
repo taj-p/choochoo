@@ -78,6 +78,13 @@ pub enum Error {
     #[error("rebase conflict on branch `{branch}`; resolve and run `choo rebase --continue`")]
     RebaseConflict { branch: String },
 
+    #[error("could not start editor `{program}`: {source}; set $EDITOR to one that exists")]
+    EditorLaunch {
+        program: String,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 

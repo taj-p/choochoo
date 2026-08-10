@@ -152,6 +152,22 @@ pub enum Command {
         #[arg(long)]
         draft: bool,
     },
+    /// Edit the train's "PR Train Context" — one block of prose that
+    /// choochoo renders at the top of every PR in the train.
+    ///
+    /// Opens `$VISUAL`/`$EDITOR` (vim by default) on the current text;
+    /// save and quit to store it, quit without saving (`:cq` in vim) to
+    /// abandon the edit. Saving an empty buffer removes the section.
+    ///
+    /// Nothing is sent to GitHub here: run `choo pr` to push the new text
+    /// into every PR description.
+    Context {
+        #[arg(short = 't', long = "train")]
+        train: Option<String>,
+        /// Print the stored context instead of opening an editor.
+        #[arg(long)]
+        show: bool,
+    },
     /// Manage a train's aggregate ("combined") branch.
     ///
     /// The aggregate branch is kept pointing at the tip of the train, so
@@ -449,6 +465,44 @@ pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
             .ok();
             if let Some(pr) = &s.aggregate_pr {
                 writeln!(&mut out, "combined draft PR: #{} <{}>", pr.number, pr.url).ok();
+            }
+        }
+        Command::Context { train: t, show } => {
+            if show {
+                let s = train::context::run_show(store, t.as_deref())?;
+                out.write_all(s.as_bytes()).ok();
+            } else {
+                let editor = crate::editor::ProcessEditor::from_env();
+                match train::context::run(store, &editor, t.as_deref())? {
+                    None => {
+                        writeln!(&mut out, "editor exited without saving; context unchanged")
+                            .ok();
+                    }
+                    Some(o) if !o.changed => {
+                        writeln!(&mut out, "context for train `{}` unchanged", o.train).ok();
+                    }
+                    Some(o) => {
+                        if o.cleared {
+                            writeln!(&mut out, "cleared context for train `{}`", o.train).ok();
+                        } else {
+                            writeln!(&mut out, "updated context for train `{}`", o.train).ok();
+                        }
+                        if o.prs == 0 {
+                            writeln!(
+                                &mut out,
+                                "run `choo pr` to open the train's PRs with it"
+                            )
+                            .ok();
+                        } else {
+                            writeln!(
+                                &mut out,
+                                "run `choo pr` to sync {} PR description(s)",
+                                o.prs
+                            )
+                            .ok();
+                        }
+                    }
+                }
             }
         }
         Command::Aggregate { action } => match action {

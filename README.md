@@ -13,7 +13,9 @@ main ── feat/part-1 ── feat/part-2 ── feat/part-3
 
 Every PR's description gets the same train table, with a "this PR" marker on
 its own row, so reviewers always see where the change fits in the overall
-plan.
+plan. A train can also carry a **PR Train Context**: one block of prose,
+edited once with `choo context`, that choochoo puts at the top of every PR in
+the train.
 
 Optionally, a train can also have an **aggregate ("combined") branch**: one
 extra branch holding *all* of the train's changes, with its own draft PR
@@ -62,6 +64,9 @@ choo add
 git checkout -b feat/part-3 feat/part-2
 # ... commit ...
 choo add
+
+# Write the context reviewers should read first (opens your editor).
+choo context
 
 # Open one PR per branch (idempotent: re-run after each push).
 choo pr
@@ -112,7 +117,9 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 | `choo rebase --continue` | Resume after resolving conflicts and running `git rebase --continue`. |
 | `choo rebase --abort` | Cancel an in-progress rebase. |
 | `choo push [-t <train>] [--without-lease] [--no-force-with-lease] [--remote origin]` | Push every branch (and the combined branch, if enabled) in a single atomic `git push`, with `--set-upstream` so each branch tracks its remote. Default: `git push --force-with-lease`. `--without-lease` uses `git push --force` (no lease check). `--no-force-with-lease` uses plain `git push` (no force at all). |
-| `choo pr [-t <train>] [--draft]` | Create or update one PR per branch and sync the train table on every PR. Also opens/updates the combined branch's draft PR (if enabled). |
+| `choo pr [-t <train>] [--draft]` | Create or update one PR per branch and sync the train table — and the [PR Train Context](#the-pr-train-context) — on every PR. Also opens/updates the combined branch's draft PR (if enabled). |
+| `choo context [-t <train>]` | Edit the train's [PR Train Context](#the-pr-train-context) in `$VISUAL`/`$EDITOR` (vim by default). Saves on write-quit; `choo pr` then pushes it to every PR. |
+| `choo context --show [-t <train>]` | Print the stored context instead of opening an editor. |
 | `choo aggregate enable [--branch <b>] [-t <train>]` | Start managing a combined branch for the train, and sync it now. |
 | `choo aggregate disable [-t <train>]` | Stop managing it. The git branch and its PR are left untouched. |
 | `choo aggregate sync [-t <train>]` | Re-point the combined branch at the train's current tip. |
@@ -125,6 +132,62 @@ and keep changes local, publishing them on your next synced command.
 
 `-t/--train` defaults to the **active** train (set by `choo init` for the
 first train, or `choo switch <name>`).
+
+## The PR Train Context
+
+Some things need saying on *every* PR in a train: why the change is split up,
+what order to read it in, which piece has the interesting bit. Written by hand
+that means pasting the same paragraph into every description — and pasting the
+correction into every description when it changes.
+
+`choo context` stores it once, on the train:
+
+```bash
+choo context            # opens $VISUAL/$EDITOR (vim by default)
+                        # write, `:wq` to save, `:cq` to abandon
+choo pr                 # every PR's description now carries it
+```
+
+The next `choo pr` renders it at the **top** of every PR in the train — above
+the train table, above your own description, and on the combined PR too:
+
+```markdown
+<!-- choochoo:context:start -->
+## PR Train Context
+
+Splitting the widget refactor so the API change can land first.
+Read from the bottom up; #101 is the only one with behaviour changes.
+<!-- choochoo:context:end -->
+
+...your own description, if any...
+
+<!-- choochoo:train:start name="my-feature" -->
+## Train: `my-feature`
+...the train table...
+<!-- choochoo:train:end -->
+```
+
+Editing it is one command plus `choo pr`; there's no per-PR step, and no PR
+that quietly kept the old wording. Saving an **empty** buffer clears the
+context, and the next `choo pr` takes the section back out of every
+description.
+
+The heading is choochoo's, so it reads the same on every train — you write the
+section's contents. Inside it, markdown is passed through untouched
+(checklists, tables, links all work).
+
+A few properties worth knowing:
+
+* **It's part of the train**, so it's [shared state](#sharing-state-across-machines):
+  write it on one devbox and the other one has it.
+* **Your own words are never touched.** choochoo owns the two marked regions
+  and nothing else. The one liberty it takes is *position*: the context block
+  is pulled back to the top on each render (that's the whole point of it), so
+  text you write above it ends up below it.
+* **`choo pr` stays idempotent.** Re-running with an unchanged context
+  rewrites nothing.
+* `choo context --show` prints the stored text, and `choo show` includes it in
+  the train summary.
 
 ## TUI keys
 
@@ -254,7 +317,9 @@ last-one-wins: one of the two entries would be silently dead.
 
 ## Mental model
 
-A **train** is just a name + a base branch + an ordered list of git branches,
+A **train** is just a name + a base branch + an ordered list of git branches
+(plus, optionally, a [context](#the-pr-train-context) and a
+[combined branch](#the-combined-branch)),
 stored in `.git/choochoo/state.json`, or in your state repo when
 [sharing](#sharing-state-across-machines) is configured. choochoo never invents commits or
 moves branches behind your back — it always uses your local `git` for git
@@ -288,12 +353,15 @@ worktree's own `.git` is a file rather than a directory.
 creates ones that don't exist yet, then re-renders every PR description so
 the train table is consistent across the stack.
 
-choochoo owns one contiguous region of each PR body, delimited by
-`<!-- choochoo:train:start ... -->` and `<!-- choochoo:train:end -->`
-markers. **Anything you write outside that region (above or below it)
-is preserved verbatim** across every re-run. For PRs created outside
-choochoo (no markers), the managed block is appended to the bottom so
-your description stays prominent at the top.
+choochoo owns up to two regions of each PR body: the train table, between
+`<!-- choochoo:train:start ... -->` and `<!-- choochoo:train:end -->`, and
+the [PR Train Context](#the-pr-train-context), between
+`<!-- choochoo:context:start -->` and `<!-- choochoo:context:end -->` (absent
+when the train has no context). **Anything you write outside those regions is
+preserved verbatim** across every re-run. For PRs created outside choochoo (no
+markers), the train block is appended to the bottom so your description stays
+prominent at the top; the context block is always placed at the very top,
+since being read first is its entire job.
 
 Older choochoo versions used a different marker scheme; on first sync the
 new layout is migrated automatically, including any prose you'd written
@@ -351,6 +419,12 @@ Tests are hermetic — no network, no `gh` auth required:
   the combined branch really does carry every file the train touches. The `pr` command is exercised against an
   in-process `FakeGh` selected by the `CHOOCHOO_GH_FAKE` environment
   variable, which records all calls in a JSON file the tests can read.
+* **`choo context`** is covered both ways: unit tests drive a `FakeEditor`,
+  and `cli_context.rs` runs the real `$EDITOR` path with the variable set to a
+  command that edits the buffer non-interactively (`cp …` to replace it,
+  `true` to leave it alone, `false` to stand in for `:cq`). That keeps the
+  shell invocation, the temp buffer and the read-back after save under test
+  without needing a terminal.
 
 Two things keep that true now that there's a config file and a remote store:
 

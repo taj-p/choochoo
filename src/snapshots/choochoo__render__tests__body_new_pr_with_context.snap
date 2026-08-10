@@ -1,0 +1,21 @@
+---
+source: src/render.rs
+expression: "render_pr_body(&t, \"b\", \"\")"
+---
+<!-- choochoo:context:start -->
+## PR Train Context
+
+Why this stack exists.
+<!-- choochoo:context:end -->
+
+<!-- choochoo:train:start name="feat" -->
+## Train: `feat`
+
+| # | Title | PR |   |
+|---|-------|----|---|
+| 1 | `a` | #10 |  |
+| 2 | `b` | #11 | **this PR** |
+| 3 | `c` | — |  |
+
+Base: `main`
+<!-- choochoo:train:end -->

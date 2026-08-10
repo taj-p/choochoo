@@ -6,6 +6,8 @@
 //!   `.git/choochoo/state.json`)
 //! - [`git`]: a [`git::GitRunner`] trait + a process-shelling implementation
 //! - [`github`]: a [`github::GhRunner`] trait + a process-shelling implementation
+//! - [`editor`]: an [`editor::Editor`] trait + a `$EDITOR`-spawning
+//!   implementation
 //! - [`render`]: pure rendering of PR descriptions and the train table
 //! - [`train`]: domain operations (add/remove/reorder/rebase/push/pr/...)
 //! - [`tui`]: a small ratatui-based interactive UI
@@ -13,6 +15,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod editor;
 pub mod error;
 pub mod git;
 pub mod github;

@@ -1,0 +1,11 @@
+---
+source: src/render.rs
+expression: render_context_block(&t).unwrap()
+---
+<!-- choochoo:context:start -->
+## PR Train Context
+
+Split for reviewability.
+
+Start at #10.
+<!-- choochoo:context:end -->

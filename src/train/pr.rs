@@ -554,6 +554,94 @@ mod tests {
         );
     }
 
+    /// The reason the feature exists: the context is stored once and lands
+    /// at the top of every PR in the train, including the combined one.
+    #[test]
+    fn train_context_appears_at_the_top_of_every_pr() {
+        let (_tmp, store, gh) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        let mut state = store.load().unwrap();
+        state
+            .train_mut("t")
+            .unwrap()
+            .set_context("Read this first.");
+        store.save(&state).unwrap();
+
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(gh.path()).unwrap()).unwrap();
+        for branch in ["a", "b", "c", "choo/t/combined"] {
+            let body = parsed["prs"][branch]["body"].as_str().unwrap();
+            assert!(
+                body.starts_with(crate::render::CONTEXT_START),
+                "`{branch}` doesn't lead with the context:\n{body}"
+            );
+            assert!(body.contains("## PR Train Context"));
+            assert!(body.contains("Read this first."));
+        }
+    }
+
+    /// Editing the context is a one-command fan-out: every description is
+    /// rewritten, and the run still settles down afterwards.
+    #[test]
+    fn editing_the_context_rewrites_every_description() {
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+
+        let mut state = store.load().unwrap();
+        state.train_mut("t").unwrap().set_context("Version one.");
+        store.save(&state).unwrap();
+        let first = run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        assert_eq!(first.updated, vec!["a", "b", "c"]);
+
+        let mut state = store.load().unwrap();
+        state.train_mut("t").unwrap().set_context("Version two.");
+        store.save(&state).unwrap();
+        let second = run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        assert_eq!(second.updated, vec!["a", "b", "c"]);
+
+        // Third run changes nothing: no drift, and no duplicated section.
+        let third = run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        assert!(third.updated.is_empty(), "got: {:?}", third.updated);
+        for branch in ["a", "b", "c"] {
+            let body = gh.get_pr(branch_pr_number(&gh, branch)).unwrap().body;
+            assert!(body.contains("Version two."));
+            assert!(!body.contains("Version one."));
+            assert_eq!(body.matches("## PR Train Context").count(), 1);
+        }
+    }
+
+    /// Clearing the context takes the section back out of every PR without
+    /// touching the user's own words.
+    #[test]
+    fn clearing_the_context_removes_the_section_from_every_pr() {
+        let (_tmp, store, gh) = setup();
+        let mut state = store.load().unwrap();
+        state.train_mut("t").unwrap().set_context("Temporary.");
+        store.save(&state).unwrap();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+
+        // The user adds their own description to one of the PRs.
+        let number = branch_pr_number(&gh, "b");
+        let body = gh.get_pr(number).unwrap().body;
+        gh.update_pr_body(number, &format!("{body}\nMy own words.\n"))
+            .unwrap();
+
+        let mut state = store.load().unwrap();
+        state.train_mut("t").unwrap().set_context("");
+        store.save(&state).unwrap();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+
+        for branch in ["a", "b", "c"] {
+            let body = gh.get_pr(branch_pr_number(&gh, branch)).unwrap().body;
+            assert!(!body.contains("## PR Train Context"), "got: {body}");
+            assert!(!body.contains(crate::render::CONTEXT_START));
+            assert!(!body.contains("Temporary."));
+        }
+        assert!(gh.get_pr(number).unwrap().body.contains("My own words."));
+    }
+
     fn branch_pr_number(gh: &FakeGh, branch: &str) -> u64 {
         gh.find_pr_for_branch(branch).unwrap().unwrap().number
     }
