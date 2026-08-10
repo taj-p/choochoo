@@ -1,0 +1,15 @@
+---
+source: src/render.rs
+expression: body
+---
+<!-- choochoo:train:start name="feat" -->
+## Train: `feat`
+
+| # | Title | PR |   |
+|---|-------|----|---|
+| 1 | `a` | #10 |  |
+| 2 | `b` | #11 | **this PR** |
+| 3 | `c` | — |  |
+
+Base: `main`
+<!-- choochoo:train:end -->

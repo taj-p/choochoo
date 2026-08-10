@@ -1,0 +1,68 @@
+//! Error types shared across the crate.
+
+use std::io;
+use std::path::PathBuf;
+
+/// Result alias used throughout the crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("io error: {0}")]
+    BareIo(#[from] io::Error),
+
+    #[error("failed to (de)serialize state: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("not inside a git repository (no .git directory found)")]
+    NotInRepo,
+
+    #[error("required tool `{0}` was not found on PATH")]
+    MissingTool(&'static str),
+
+    #[error("git failed ({code}): {stderr}")]
+    Git { code: i32, stderr: String },
+
+    #[error("gh failed ({code}): {stderr}")]
+    Gh { code: i32, stderr: String },
+
+    #[error("could not parse output of `{cmd}`: {reason}")]
+    ParseOutput { cmd: &'static str, reason: String },
+
+    #[error("train `{0}` does not exist")]
+    UnknownTrain(String),
+
+    #[error("train `{0}` already exists")]
+    TrainExists(String),
+
+    #[error("branch `{branch}` is not in train `{train}`")]
+    BranchNotInTrain { train: String, branch: String },
+
+    #[error("branch `{branch}` is already in train `{train}`")]
+    BranchAlreadyInTrain { train: String, branch: String },
+
+    #[error("branch `{0}` does not exist locally")]
+    UnknownBranch(String),
+
+    #[error("no active train; pass --train or run `choo switch <name>`")]
+    NoActiveTrain,
+
+    #[error("rebase conflict on branch `{branch}`; resolve and run `choo rebase --continue`")]
+    RebaseConflict { branch: String },
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("state file is corrupted: {0}")]
+    CorruptState(String),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
