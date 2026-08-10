@@ -101,9 +101,20 @@ pub fn render_managed_block(train: &Train, current: &str) -> String {
     out.push_str(&format!("## Train: `{}`\n\n", train.name));
     out.push_str(&render_table(train, Some(current)));
     out.push_str(&format!("\nBase: `{}`\n", train.base));
+    if let Some(branch) = train.aggregate_branch() {
+        out.push_str(&format!(
+            "\n`{AGGREGATE_ROW_LABEL}` — combined branch `{branch}`: every change in the \
+             train as one draft PR against `{base}`, for review and CI only. \
+             Merge the PRs above, not this one.\n",
+            base = train.base,
+        ));
+    }
     out.push_str(TRAIN_END_MARKER);
     out
 }
+
+/// Row label used in the `#` column for the aggregate ("combined") row.
+pub const AGGREGATE_ROW_LABEL: &str = "Σ";
 
 /// Render the markdown train table. If `highlight` matches a branch in the
 /// train, mark it with "this PR" in the rightmost column.
@@ -111,33 +122,53 @@ pub fn render_managed_block(train: &Train, current: &str) -> String {
 /// The Title column shows the PR title (as last seen on GitHub); when no
 /// PR exists yet or no title is recorded we fall back to the branch name
 /// in backticks so the table is still useful mid-creation.
+///
+/// A train with an aggregate branch gets one extra row, numbered
+/// [`AGGREGATE_ROW_LABEL`] rather than a position, because it sits beside
+/// the stack rather than in it.
 pub fn render_table(train: &Train, highlight: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str("| # | Title | PR |   |\n");
     out.push_str("|---|-------|----|---|\n");
     for (i, branch) in train.branches.iter().enumerate() {
         let info = train.prs.get(branch);
-        let title_cell = match info.and_then(|p| p.title.as_deref()) {
-            Some(t) => escape_table_cell(t),
-            None => format!("`{}`", branch),
-        };
-        let pr_cell = match info {
-            Some(PrInfo { number, .. }) => format!("#{number}"),
-            None => "—".to_string(),
-        };
-        let marker = match highlight {
-            Some(h) if h == branch => "**this PR**",
-            _ => "",
-        };
-        out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            i + 1,
-            title_cell,
-            pr_cell,
-            marker,
+        out.push_str(&render_row(
+            &(i + 1).to_string(),
+            branch,
+            info,
+            highlight,
+        ));
+    }
+    if let Some(agg) = &train.aggregate {
+        out.push_str(&render_row(
+            AGGREGATE_ROW_LABEL,
+            &agg.branch,
+            agg.pr.as_ref(),
+            highlight,
         ));
     }
     out
+}
+
+fn render_row(
+    number_cell: &str,
+    branch: &str,
+    info: Option<&PrInfo>,
+    highlight: Option<&str>,
+) -> String {
+    let title_cell = match info.and_then(|p| p.title.as_deref()) {
+        Some(t) => escape_table_cell(t),
+        None => format!("`{branch}`"),
+    };
+    let pr_cell = match info {
+        Some(PrInfo { number, .. }) => format!("#{number}"),
+        None => "—".to_string(),
+    };
+    let marker = match highlight {
+        Some(h) if h == branch => "**this PR**",
+        _ => "",
+    };
+    format!("| {number_cell} | {title_cell} | {pr_cell} | {marker} |\n")
 }
 
 /// Escape characters that would break a markdown table cell: pipe and
@@ -341,6 +372,80 @@ mod tests {
         let t = sample_train();
         let body = render_pr_body(&t, "b", "");
         insta::assert_snapshot!("body_new_pr", body);
+    }
+
+    #[test]
+    fn table_appends_aggregate_row_after_the_branches() {
+        let mut t = sample_train();
+        t.aggregate = Some(crate::state::Aggregate {
+            branch: "choo/feat/combined".into(),
+            pr: Some(PrInfo {
+                number: 12,
+                url: "u".into(),
+                title: Some("Combined: feat".into()),
+                last_pushed_sha: None,
+            }),
+        });
+        insta::assert_snapshot!("table_with_aggregate", render_table(&t, Some("a")));
+    }
+
+    #[test]
+    fn aggregate_row_can_be_the_highlighted_one() {
+        let mut t = sample_train();
+        t.aggregate = Some(crate::state::Aggregate::new("choo/feat/combined"));
+        let out = render_table(&t, Some("choo/feat/combined"));
+        // No PR yet -> branch name fallback and an em-dash PR cell.
+        assert!(
+            out.contains("| Σ | `choo/feat/combined` | — | **this PR** |"),
+            "got: {out}"
+        );
+        // ...and none of the stack rows are marked.
+        assert_eq!(out.matches("**this PR**").count(), 1);
+    }
+
+    #[test]
+    fn table_has_no_aggregate_row_when_disabled() {
+        let t = sample_train();
+        assert!(!render_table(&t, None).contains(AGGREGATE_ROW_LABEL));
+    }
+
+    #[test]
+    fn managed_block_explains_the_aggregate_row() {
+        let mut t = sample_train();
+        t.aggregate = Some(crate::state::Aggregate::new("choo/feat/combined"));
+        let block = render_managed_block(&t, "a");
+        assert!(block.contains("combined branch `choo/feat/combined`"));
+        assert!(block.contains("draft PR against `main`"));
+        assert!(block.contains("Merge the PRs above, not this one."));
+    }
+
+    #[test]
+    fn managed_block_omits_the_legend_when_disabled() {
+        let t = sample_train();
+        assert!(!render_managed_block(&t, "a").contains("combined branch"));
+    }
+
+    #[test]
+    fn rerender_stays_idempotent_with_an_aggregate_row() {
+        let mut t = sample_train();
+        t.aggregate = Some(crate::state::Aggregate::new("choo/feat/combined"));
+        let first = rerender_pr_body(&t, "choo/feat/combined", "Notes above.");
+        let second = rerender_pr_body(&t, "choo/feat/combined", &first);
+        assert_eq!(first, second);
+        assert!(second.starts_with("Notes above."));
+    }
+
+    /// Enabling the aggregate on an existing train must rewrite bodies
+    /// that were rendered before it existed, without eating user content.
+    #[test]
+    fn rerender_adds_the_aggregate_row_to_an_older_body() {
+        let mut t = sample_train();
+        let before = rerender_pr_body(&t, "a", "My description.");
+        assert!(!before.contains(AGGREGATE_ROW_LABEL));
+        t.aggregate = Some(crate::state::Aggregate::new("choo/feat/combined"));
+        let after = rerender_pr_body(&t, "a", &before);
+        assert!(after.starts_with("My description."));
+        assert!(after.contains("| Σ | `choo/feat/combined` |"));
     }
 
     #[test]

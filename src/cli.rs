@@ -24,6 +24,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Create a new (empty) train.
     Init {
@@ -32,6 +33,15 @@ pub enum Command {
         /// Base branch the train sits on top of.
         #[arg(long, default_value = "main")]
         base: String,
+        /// Also manage an aggregate ("combined") branch for this train: one
+        /// extra branch holding every change in the train, with its own
+        /// draft PR against the base branch.
+        #[arg(long)]
+        aggregate: bool,
+        /// Name for the aggregate branch (implies `--aggregate`).
+        /// Defaults to `choo/<train>/combined`.
+        #[arg(long = "aggregate-branch", value_name = "BRANCH")]
+        aggregate_branch: Option<String>,
     },
     /// List every train in this repo.
     List,
@@ -110,15 +120,51 @@ pub enum Command {
         remote: String,
     },
     /// Create or update one PR per branch in the train and sync the table.
+    ///
+    /// When the train has an aggregate branch, its draft PR (against the
+    /// train's base) is created/updated too.
     Pr {
         #[arg(short = 't', long = "train")]
         train: Option<String>,
-        /// Open PRs as drafts.
+        /// Open PRs as drafts. The aggregate PR is always a draft.
         #[arg(long)]
         draft: bool,
     },
+    /// Manage a train's aggregate ("combined") branch.
+    ///
+    /// The aggregate branch is kept pointing at the tip of the train, so
+    /// its diff against the train's base is every change in the train. Its
+    /// PR is always a draft: it exists for whole-change review and CI, and
+    /// the per-branch PRs are what get merged.
+    Aggregate {
+        #[command(subcommand)]
+        action: AggregateCommand,
+    },
     /// Launch the interactive TUI.
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AggregateCommand {
+    /// Start managing an aggregate branch for the train.
+    Enable {
+        /// Branch name. Defaults to `choo/<train>/combined`.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+        #[arg(short = 't', long = "train")]
+        train: Option<String>,
+    },
+    /// Stop managing the aggregate branch. The git branch and its PR are
+    /// left alone.
+    Disable {
+        #[arg(short = 't', long = "train")]
+        train: Option<String>,
+    },
+    /// Re-point the aggregate branch at the current tip of the train.
+    Sync {
+        #[arg(short = 't', long = "train")]
+        train: Option<String>,
+    },
 }
 
 /// Entry point used by `main.rs`. Parses argv and dispatches.
@@ -132,9 +178,26 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cli.command {
-        Command::Init { name, base } => {
+        Command::Init {
+            name,
+            base,
+            aggregate,
+            aggregate_branch,
+        } => {
             train::init::run(repo_root, &name, &base)?;
             writeln!(&mut out, "created train `{name}` (base `{base}`)").ok();
+            if aggregate || aggregate_branch.is_some() {
+                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let mut reporter = StderrReporter::new();
+                let branch = train::aggregate::enable(
+                    repo_root,
+                    &git,
+                    &mut reporter,
+                    Some(&name),
+                    aggregate_branch.as_deref(),
+                )?;
+                writeln!(&mut out, "combined branch: `{branch}` (targets `{base}`)").ok();
+            }
         }
         Command::List => {
             let s = train::show::run_list(repo_root)?;
@@ -208,6 +271,9 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                     s.rebased.len()
                 )
                 .ok();
+                if let Some(branch) = &s.aggregate_synced {
+                    writeln!(&mut out, "combined branch `{branch}` synced to tip").ok();
+                }
             }
         }
         Command::Push {
@@ -239,6 +305,9 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 s.pushed.len()
             )
             .ok();
+            if let Some(branch) = &s.aggregate_pushed {
+                writeln!(&mut out, "pushed combined branch `{branch}`").ok();
+            }
         }
         Command::Pr { train: t, draft } => {
             let gh = github::make_runner()?;
@@ -252,7 +321,56 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 s.updated.len()
             )
             .ok();
+            if let Some(pr) = &s.aggregate_pr {
+                writeln!(&mut out, "combined draft PR: #{} <{}>", pr.number, pr.url).ok();
+            }
         }
+        Command::Aggregate { action } => match action {
+            AggregateCommand::Enable { branch, train: t } => {
+                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let mut reporter = StderrReporter::new();
+                let branch = train::aggregate::enable(
+                    repo_root,
+                    &git,
+                    &mut reporter,
+                    t.as_deref(),
+                    branch.as_deref(),
+                )?;
+                writeln!(
+                    &mut out,
+                    "combined branch `{branch}` enabled; run `choo push` then \
+                     `choo pr` to open its draft PR"
+                )
+                .ok();
+            }
+            AggregateCommand::Disable { train: t } => {
+                let branch = train::aggregate::disable(repo_root, t.as_deref())?;
+                writeln!(
+                    &mut out,
+                    "combined branch `{branch}` no longer managed (branch and PR left as-is)"
+                )
+                .ok();
+            }
+            AggregateCommand::Sync { train: t } => {
+                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let mut reporter = StderrReporter::new();
+                match train::aggregate::run_sync(repo_root, &git, &mut reporter, t.as_deref())? {
+                    Some(o) => {
+                        writeln!(
+                            &mut out,
+                            "combined branch `{}` -> tip of `{}` ({})",
+                            o.branch,
+                            o.tip,
+                            if o.moved { "updated" } else { "already current" }
+                        )
+                        .ok();
+                    }
+                    None => {
+                        writeln!(&mut out, "nothing to sync (train has no branches)").ok();
+                    }
+                }
+            }
+        },
         Command::Tui => {
             crate::tui::run(repo_root)?;
         }

@@ -1,4 +1,8 @@
 //! `choo push` — push every branch in a train.
+//!
+//! When the train has an aggregate branch it is re-synced to the train tip
+//! and pushed last, so the combined PR always shows the same commits the
+//! per-branch PRs were just pushed with.
 
 use std::path::Path;
 
@@ -6,12 +10,15 @@ use crate::error::Result;
 use crate::git::{GitRunner, PushMode};
 use crate::report::Reporter;
 use crate::state;
+use crate::train::aggregate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushSummary {
     pub train: String,
     pub pushed: Vec<String>,
     pub mode: PushMode,
+    /// The aggregate branch, when one was synced and pushed by this run.
+    pub aggregate_pushed: Option<String>,
 }
 
 pub fn run(
@@ -53,11 +60,40 @@ pub fn run(
         }
         pushed.push(branch.clone());
     }
+
+    // The aggregate branch is derived state: re-point it at the tip we just
+    // pushed, then push it too.
+    let train = state.train(&train_name)?.clone();
+    let mut aggregate_pushed = None;
+    if let Some(outcome) = aggregate::sync_train(git, reporter, &train)? {
+        reporter.start(&format!(
+            "pushing combined branch `{}` to `{remote}` [{mode_label}]",
+            outcome.branch
+        ));
+        match git.push(&outcome.branch, mode, remote) {
+            Ok(()) => reporter.ok(""),
+            Err(e) => {
+                reporter.fail(&e.to_string());
+                return Err(e);
+            }
+        }
+        if let Some(pr) = state
+            .train_mut(&train_name)?
+            .aggregate
+            .as_mut()
+            .and_then(|a| a.pr.as_mut())
+        {
+            pr.last_pushed_sha = Some(outcome.sha.clone());
+        }
+        aggregate_pushed = Some(outcome.branch);
+    }
+
     state::save(repo_root, &state)?;
     Ok(PushSummary {
         train: train_name,
         pushed,
         mode,
+        aggregate_pushed,
     })
 }
 
@@ -73,7 +109,7 @@ mod tests {
     use tempfile::TempDir;
 
     struct FakeGit {
-        tips: BTreeMap<String, String>,
+        tips: RefCell<BTreeMap<String, String>>,
         pushes: RefCell<Vec<(String, PushMode, String)>>,
     }
 
@@ -82,16 +118,25 @@ mod tests {
             Ok("a".into())
         }
         fn branch_exists(&self, name: &str) -> Result<bool> {
-            Ok(self.tips.contains_key(name))
+            Ok(self.tips.borrow().contains_key(name))
         }
         fn checkout(&self, _b: &str) -> Result<()> {
             Ok(())
         }
         fn rev_parse(&self, rev: &str) -> Result<String> {
             self.tips
+                .borrow()
                 .get(rev)
                 .cloned()
                 .ok_or_else(|| Error::UnknownBranch(rev.to_string()))
+        }
+        fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()> {
+            // A rev that isn't a branch is a raw SHA, as with real git.
+            let target = self
+                .rev_parse(to_rev)
+                .unwrap_or_else(|_| to_rev.to_string());
+            self.tips.borrow_mut().insert(branch.to_string(), target);
+            Ok(())
         }
         fn rebase_onto(
             &self,
@@ -139,13 +184,23 @@ mod tests {
         state::save(tmp.path(), &state).unwrap();
 
         let git = FakeGit {
-            tips: [("main", "M"), ("a", "A1"), ("b", "B1")]
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
+            tips: RefCell::new(
+                [("main", "M"), ("a", "A1"), ("b", "B1")]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+            ),
             pushes: RefCell::new(Vec::new()),
         };
         (tmp, git)
+    }
+
+    /// Turn on the aggregate branch for the fixture train.
+    fn enable_aggregate(tmp: &TempDir, branch: &str) {
+        let mut state = state::load(tmp.path()).unwrap();
+        state.train_mut("t").unwrap().aggregate =
+            Some(crate::state::Aggregate::new(branch));
+        state::save(tmp.path(), &state).unwrap();
     }
 
     #[test]
@@ -243,6 +298,77 @@ mod tests {
         assert!(rep.events[0].ends_with("ok"));
         assert!(rep.events[1].contains("pushing `b`"));
         assert!(rep.events[1].contains("(2/2)"));
+    }
+
+    #[test]
+    fn aggregate_branch_is_synced_then_pushed_last() {
+        let (tmp, git) = setup();
+        enable_aggregate(&tmp, "choo/t/combined");
+        let summary = run(
+            tmp.path(),
+            &git,
+            &mut NullReporter,
+            None,
+            PushMode::ForceWithLease,
+            "origin",
+        )
+        .unwrap();
+
+        assert_eq!(summary.pushed, vec!["a", "b"]);
+        assert_eq!(summary.aggregate_pushed.as_deref(), Some("choo/t/combined"));
+        let pushed: Vec<String> = git
+            .pushes
+            .borrow()
+            .iter()
+            .map(|(b, _, _)| b.clone())
+            .collect();
+        assert_eq!(pushed, vec!["a", "b", "choo/t/combined"]);
+        // Synced to the tip (`b`) before being pushed.
+        assert_eq!(git.rev_parse("choo/t/combined").unwrap(), "B1");
+    }
+
+    #[test]
+    fn aggregate_pr_records_the_pushed_sha() {
+        let (tmp, git) = setup();
+        enable_aggregate(&tmp, "choo/t/combined");
+        let mut state = state::load(tmp.path()).unwrap();
+        state.train_mut("t").unwrap().aggregate.as_mut().unwrap().pr = Some(PrInfo {
+            number: 9,
+            url: "u".into(),
+            title: None,
+            last_pushed_sha: None,
+        });
+        state::save(tmp.path(), &state).unwrap();
+
+        run(
+            tmp.path(),
+            &git,
+            &mut NullReporter,
+            None,
+            PushMode::ForceWithLease,
+            "origin",
+        )
+        .unwrap();
+
+        let state = state::load(tmp.path()).unwrap();
+        let agg = state.train("t").unwrap().aggregate.clone().unwrap();
+        assert_eq!(agg.pr.unwrap().last_pushed_sha.as_deref(), Some("B1"));
+    }
+
+    #[test]
+    fn no_aggregate_means_nothing_extra_is_pushed() {
+        let (tmp, git) = setup();
+        let summary = run(
+            tmp.path(),
+            &git,
+            &mut NullReporter,
+            None,
+            PushMode::ForceWithLease,
+            "origin",
+        )
+        .unwrap();
+        assert!(summary.aggregate_pushed.is_none());
+        assert_eq!(git.pushes.borrow().len(), 2);
     }
 
     #[test]

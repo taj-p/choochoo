@@ -32,6 +32,13 @@ pub(crate) fn apply(train: &mut Train, branch: &str) -> Result<()> {
             train.base
         )));
     }
+    if train.is_aggregate(branch) {
+        return Err(Error::InvalidArgument(format!(
+            "`{branch}` is train `{}`'s combined branch; it mirrors the train \
+             rather than being part of it",
+            train.name
+        )));
+    }
     if train.position(branch).is_some() {
         return Err(Error::BranchAlreadyInTrain {
             train: train.name.clone(),
@@ -67,5 +74,14 @@ mod tests {
         let mut t = Train::new("t", "main");
         let err = apply(&mut t, "main").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn rejects_the_aggregate_branch() {
+        let mut t = Train::new("t", "main");
+        t.aggregate = Some(crate::state::Aggregate::new("choo/t/combined"));
+        let err = apply(&mut t, "choo/t/combined").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert!(t.branches.is_empty());
     }
 }

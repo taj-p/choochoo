@@ -250,7 +250,7 @@ fn draw(frame: &mut Frame, app: &App) {
                 return;
             };
             let title = format!(" train: {} (base: {}) ", t.name, t.base);
-            let items: Vec<ListItem> = t
+            let mut items: Vec<ListItem> = t
                 .branches
                 .iter()
                 .enumerate()
@@ -269,6 +269,19 @@ fn draw(frame: &mut Frame, app: &App) {
                     ListItem::new(line).style(style)
                 })
                 .collect();
+            // The combined branch isn't part of the stack, so it's listed
+            // after it and never selectable.
+            if let Some(agg) = &t.aggregate {
+                let pr = agg
+                    .pr
+                    .as_ref()
+                    .map(|p| format!("draft #{}", p.number))
+                    .unwrap_or_else(|| "—".into());
+                items.push(
+                    ListItem::new(format!(" Σ. {}   {pr}", agg.branch))
+                        .style(Style::default().add_modifier(Modifier::DIM)),
+                );
+            }
             let list = List::new(items).block(Block::bordered().title(title));
             frame.render_widget(list, layout[1]);
         }

@@ -9,6 +9,7 @@
 //!   the integration tests against fake runners.
 
 pub mod add;
+pub mod aggregate;
 pub mod checkout;
 pub mod init;
 pub mod pr;

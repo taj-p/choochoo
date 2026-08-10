@@ -185,7 +185,10 @@ fn drive(
         train: progress.train.clone(),
         rebased: Vec::new(),
         skipped: Vec::new(),
+        aggregate_synced: None,
     };
+
+    let mut aggregate_synced = None;
 
     while progress.next_pair < plan.len() {
         let step = &plan[progress.next_pair];
@@ -217,6 +220,14 @@ fn drive(
         }
     }
 
+    // The restack moved every branch, so the aggregate branch is stale:
+    // re-point it at the (new) tip. Only reached once the whole train is
+    // restacked — a half-rebased train has nothing meaningful to mirror.
+    if let Some(outcome) = crate::train::aggregate::sync_train(git, reporter, &train)? {
+        aggregate_synced = Some(outcome.branch);
+    }
+    summary.aggregate_synced = aggregate_synced;
+
     clear_progress(repo_root)?;
     Ok(summary)
 }
@@ -240,6 +251,8 @@ pub struct RebaseOutcomeSummary {
     pub rebased: Vec<String>,
     /// Reserved for future "no-op" detection. Currently always empty.
     pub skipped: Vec<String>,
+    /// The aggregate branch, if one was re-pointed at the restacked tip.
+    pub aggregate_synced: Option<String>,
 }
 
 #[cfg(test)]
@@ -361,6 +374,14 @@ mod tests {
             *self.force_conflict_on.borrow_mut() = None;
             Ok(())
         }
+        fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()> {
+            // A rev that isn't a branch is a raw SHA, as with real git.
+            let target = self
+                .rev_parse(to_rev)
+                .unwrap_or_else(|_| to_rev.to_string());
+            self.tips.borrow_mut().insert(branch.to_string(), target);
+            Ok(())
+        }
         fn push(&self, _b: &str, _m: crate::git::PushMode, _r: &str) -> Result<()> {
             Ok(())
         }
@@ -407,6 +428,55 @@ mod tests {
             ]
         );
         assert!(!progress_path(tmp.path()).exists());
+    }
+
+    /// Enable the aggregate branch on the fixture train.
+    fn enable_aggregate(tmp: &TempDir, branch: &str) {
+        let mut state = state::load(tmp.path()).unwrap();
+        state.train_mut("t").unwrap().aggregate =
+            Some(crate::state::Aggregate::new(branch));
+        state::save(tmp.path(), &state).unwrap();
+    }
+
+    #[test]
+    fn aggregate_branch_follows_the_restacked_tip() {
+        let (tmp, git, _) = fake_repo();
+        enable_aggregate(&tmp, "choo/t/combined");
+        let summary = run(tmp.path(), &git, &mut NullReporter, None).unwrap();
+        assert_eq!(
+            summary.aggregate_synced.as_deref(),
+            Some("choo/t/combined")
+        );
+        // `c` is the tip and ends at M+a+b+c after the restack.
+        assert_eq!(git.rev_parse("c").unwrap(), "M+a+b+c");
+        assert_eq!(git.rev_parse("choo/t/combined").unwrap(), "M+a+b+c");
+    }
+
+    #[test]
+    fn aggregate_branch_is_not_synced_while_a_conflict_is_unresolved() {
+        let (tmp, git, _) = fake_repo();
+        enable_aggregate(&tmp, "choo/t/combined");
+        *git.force_conflict_on.borrow_mut() = Some("b".into());
+        let _ = run(tmp.path(), &git, &mut NullReporter, None);
+        assert!(
+            !git.branch_exists("choo/t/combined").unwrap(),
+            "a half-restacked train must not update the combined branch"
+        );
+
+        // Once the rest of the train lands, `--continue` syncs it.
+        *git.force_conflict_on.borrow_mut() = None;
+        git.tips
+            .borrow_mut()
+            .insert("b".into(), "M+a+b-resolved".into());
+        let summary = continue_run(tmp.path(), &git, &mut NullReporter).unwrap();
+        assert_eq!(
+            summary.aggregate_synced.as_deref(),
+            Some("choo/t/combined")
+        );
+        assert_eq!(
+            git.rev_parse("choo/t/combined").unwrap(),
+            git.rev_parse("c").unwrap()
+        );
     }
 
     #[test]

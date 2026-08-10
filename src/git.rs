@@ -68,6 +68,12 @@ pub trait GitRunner {
     ) -> Result<RebaseOutcome>;
     /// Abort an in-progress rebase. No-op if no rebase is in progress.
     fn rebase_abort(&self) -> Result<()>;
+    /// Create or force-move `branch` so it points at `to_rev`. Equivalent
+    /// to `git branch --force <branch> <to_rev>`; used to keep a train's
+    /// aggregate branch pinned to its tip. Must not touch the working
+    /// tree, so it fails when `branch` is the currently checked-out branch
+    /// and would have to move.
+    fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()>;
     fn push(&self, branch: &str, mode: PushMode, remote: &str) -> Result<()>;
     fn fetch(&self, remote: &str) -> Result<()>;
     /// Best-effort: returns Some((ahead, behind)) if both refs are valid.
@@ -192,6 +198,24 @@ impl GitRunner for ProcessGitRunner {
             })?;
         // Ignore failure - it just means there's no rebase to abort.
         let _ = output;
+        Ok(())
+    }
+
+    fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()> {
+        let target = self.rev_parse(to_rev)?;
+        if self.branch_exists(branch)? && self.rev_parse(branch)? == target {
+            return Ok(()); // already there; nothing to move.
+        }
+        // `git branch --force` refuses to move the checked-out branch, and
+        // we deliberately don't reach for `git reset --hard` (it would
+        // discard the user's working tree). Say so plainly instead.
+        if self.current_branch()? == branch {
+            return Err(Error::InvalidArgument(format!(
+                "branch `{branch}` is checked out and would have to move; \
+                 check out another branch first"
+            )));
+        }
+        self.run(["branch", "--force", branch, &target])?;
         Ok(())
     }
 

@@ -47,6 +47,63 @@ pub struct Train {
     pub branches: Vec<String>,
     #[serde(default)]
     pub prs: BTreeMap<String, PrInfo>,
+    /// Optional aggregate ("combined") branch: a branch choochoo keeps
+    /// pointing at the train's tip, with its own draft PR against `base`,
+    /// so reviewers can see every change in the train at once. Absent
+    /// unless the user enabled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<Aggregate>,
+}
+
+/// The train's aggregate branch and its draft PR.
+///
+/// The branch is *derived* state: choochoo force-updates it to the tip of
+/// the train (the last branch) whenever the train is rebased, pushed, or
+/// explicitly synced, so its diff against `base` is exactly the union of
+/// every change in the train.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Aggregate {
+    /// Branch name choochoo owns and keeps in sync with the train tip.
+    pub branch: String,
+    /// The aggregate branch's PR (always opened as a draft), once created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrInfo>,
+}
+
+impl Aggregate {
+    pub fn new(branch: impl Into<String>) -> Self {
+        Self {
+            branch: branch.into(),
+            pr: None,
+        }
+    }
+}
+
+/// Default aggregate branch name for a train: `choo/<train>/combined`,
+/// with characters git won't accept in a ref replaced by `-`.
+pub fn default_aggregate_branch(train_name: &str) -> String {
+    format!("choo/{}/combined", sanitize_ref_component(train_name))
+}
+
+/// Make `s` safe to embed in a git ref path component: git rejects
+/// whitespace, `~^:?*[\`, and `..` sequences, and dislikes leading dots.
+fn sanitize_ref_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let bad = ch.is_whitespace()
+            || ch.is_control()
+            || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | ']' | '\\' | '/');
+        out.push(if bad { '-' } else { ch });
+    }
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    let trimmed = out.trim_matches('.').trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "train".to_string()
+    } else {
+        trimmed
+    }
 }
 
 impl Train {
@@ -56,7 +113,24 @@ impl Train {
             base: base.into(),
             branches: Vec::new(),
             prs: BTreeMap::new(),
+            aggregate: None,
         }
+    }
+
+    /// The aggregate branch name, if the aggregate branch is enabled.
+    pub fn aggregate_branch(&self) -> Option<&str> {
+        self.aggregate.as_ref().map(|a| a.branch.as_str())
+    }
+
+    /// The last branch in the train — the one whose content the aggregate
+    /// branch mirrors. [`None`] for an empty train.
+    pub fn tip(&self) -> Option<&str> {
+        self.branches.last().map(String::as_str)
+    }
+
+    /// True when `branch` is this train's aggregate branch.
+    pub fn is_aggregate(&self, branch: &str) -> bool {
+        self.aggregate_branch() == Some(branch)
     }
 
     /// Returns `(parent, branch)` pairs for every branch in the train,
@@ -178,6 +252,26 @@ impl Train {
                 return Err(Error::CorruptState(format!(
                     "train `{}` has PR metadata for unknown branch `{}`",
                     self.name, branch
+                )));
+            }
+        }
+        if let Some(agg) = &self.aggregate {
+            if agg.branch.trim().is_empty() {
+                return Err(Error::CorruptState(format!(
+                    "train `{}` has an empty aggregate branch name",
+                    self.name
+                )));
+            }
+            if agg.branch == self.base {
+                return Err(Error::CorruptState(format!(
+                    "train `{}` uses its base `{}` as the aggregate branch",
+                    self.name, self.base
+                )));
+            }
+            if seen.contains(agg.branch.as_str()) {
+                return Err(Error::CorruptState(format!(
+                    "train `{}` aggregate branch `{}` is also a train branch",
+                    self.name, agg.branch
                 )));
             }
         }
@@ -318,6 +412,83 @@ mod tests {
             },
         );
         assert!(train.validate().is_err());
+    }
+
+    #[test]
+    fn aggregate_branch_equal_to_base_fails_validation() {
+        let mut train = make_train("t", "main", &["a"]);
+        train.aggregate = Some(Aggregate::new("main"));
+        assert!(train.validate().is_err());
+    }
+
+    #[test]
+    fn aggregate_branch_also_in_train_fails_validation() {
+        let mut train = make_train("t", "main", &["a", "b"]);
+        train.aggregate = Some(Aggregate::new("b"));
+        assert!(train.validate().is_err());
+    }
+
+    #[test]
+    fn aggregate_branch_alongside_train_validates() {
+        let mut train = make_train("t", "main", &["a", "b"]);
+        train.aggregate = Some(Aggregate::new("choo/t/combined"));
+        train.validate().unwrap();
+        assert_eq!(train.aggregate_branch(), Some("choo/t/combined"));
+        assert_eq!(train.tip(), Some("b"));
+        assert!(train.is_aggregate("choo/t/combined"));
+        assert!(!train.is_aggregate("b"));
+    }
+
+    #[test]
+    fn default_aggregate_branch_is_ref_safe() {
+        assert_eq!(default_aggregate_branch("feat"), "choo/feat/combined");
+        // Whitespace and ref-hostile characters are replaced.
+        assert_eq!(
+            default_aggregate_branch("my feat~1"),
+            "choo/my-feat-1/combined"
+        );
+        assert_eq!(default_aggregate_branch("a..b"), "choo/a.b/combined");
+        assert_eq!(default_aggregate_branch("  "), "choo/train/combined");
+    }
+
+    /// State files written before the aggregate feature existed must still
+    /// load (the field is absent), and must not gain the key on rewrite.
+    #[test]
+    fn state_without_aggregate_field_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".git/choochoo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            r#"{"version":1,"active":"t","trains":{"t":{"name":"t","base":"main","branches":["a"],"prs":{}}}}"#,
+        )
+        .unwrap();
+        let loaded = load(tmp.path()).unwrap();
+        assert!(loaded.train("t").unwrap().aggregate.is_none());
+        save(tmp.path(), &loaded).unwrap();
+        let text = fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(!text.contains("aggregate"), "got: {text}");
+    }
+
+    #[test]
+    fn aggregate_survives_save_load_with_pr() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let mut state = StateFile::default();
+        let mut train = make_train("feat", "main", &["a"]);
+        train.aggregate = Some(Aggregate {
+            branch: "choo/feat/combined".into(),
+            pr: Some(PrInfo {
+                number: 99,
+                url: "https://example/pr/99".into(),
+                title: Some("Combined: feat".into()),
+                last_pushed_sha: None,
+            }),
+        });
+        state.trains.insert("feat".into(), train);
+        state.active = Some("feat".into());
+        save(tmp.path(), &state).unwrap();
+        assert_eq!(load(tmp.path()).unwrap(), state);
     }
 
     #[test]
