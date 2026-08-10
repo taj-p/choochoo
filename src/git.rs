@@ -58,6 +58,20 @@ pub trait GitRunner {
     fn branch_exists(&self, name: &str) -> Result<bool>;
     fn checkout(&self, branch: &str) -> Result<()>;
     fn rev_parse(&self, rev: &str) -> Result<String>;
+    /// Whether `ancestor` is an ancestor of `descendant`. A commit counts as
+    /// its own ancestor.
+    ///
+    /// False when either rev doesn't name a commit *in this repository*.
+    /// "Not here" is an ordinary situation, not an error: a SHA choochoo
+    /// recorded earlier can legitimately be absent — state synced from
+    /// another machine naming commits this one has never fetched, or a
+    /// commit that has since been garbage-collected. Callers treat that the
+    /// same as "not an ancestor": don't trust it, fall back.
+    ///
+    /// Deliberately not built on [`GitRunner::rev_parse`] as an existence
+    /// check: plain `git rev-parse` *succeeds* and echoes back any
+    /// syntactically valid 40-hex string, whether or not the object exists.
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool>;
     /// Rebase `branch` so commits in `upstream..branch` are replayed onto
     /// `onto`. Equivalent to `git rebase --onto <onto> <upstream> <branch>`.
     fn rebase_onto(
@@ -215,6 +229,21 @@ impl GitRunner for ProcessGitRunner {
 
     fn rev_parse(&self, rev: &str) -> Result<String> {
         self.run(["rev-parse", rev])
+    }
+
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let output = self
+            .cmd()
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .output()
+            .map_err(|e| Error::Io {
+                path: self.git_bin.clone(),
+                source: e,
+            })?;
+        // 0 = yes. 1 = no. 128 = one of the revs doesn't name a commit here,
+        // which is a "don't know" and must answer `false` rather than error —
+        // see the trait doc.
+        Ok(output.status.success())
     }
 
     fn rebase_onto(

@@ -169,6 +169,34 @@ pub struct Train {
     pub branches: Vec<String>,
     #[serde(default)]
     pub prs: BTreeMap<String, PrInfo>,
+    /// Per-branch record of the commit that branch's own commits sit directly
+    /// on top of — its *true* base.
+    ///
+    /// This is the `<upstream>` boundary `choo rebase` needs. The obvious
+    /// proxy — the parent branch's tip as it was before the restack — is only
+    /// correct while nobody rewrites history mid-stack: after
+    /// `git commit --amend` on `b1`, `b1`'s tip is a commit `b2` has never
+    /// heard of, the replay range widens to include `b1`'s *orphaned*
+    /// pre-amend commit, and resolving the resulting conflict quietly
+    /// reintroduces the pre-amend content into every branch above.
+    ///
+    /// A recorded base doesn't have that failure mode: it's by construction
+    /// an ancestor of the branch, so the replay range is exactly that
+    /// branch's own commits. Recorded by `choo add` and refreshed after every
+    /// successful pair of a `choo rebase`.
+    ///
+    /// Absent for trains built by an older choochoo, and never trusted
+    /// blindly — see [`crate::train::rebase`], which verifies the entry is
+    /// still an ancestor of the branch and otherwise falls back to the old
+    /// snapshot behaviour.
+    ///
+    /// Known gap: `choo add` records the current train tip, which is correct
+    /// only when branches are appended in stack order. An out-of-order append
+    /// records a base that is too far back — indistinguishable from a
+    /// legitimate multi-commit branch, so it can't be detected here. It
+    /// self-heals on the first successful `choo rebase`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branch_bases: BTreeMap<String, String>,
     /// Optional aggregate ("combined") branch: a branch choochoo keeps
     /// pointing at the train's tip, with its own draft PR against `base`,
     /// so reviewers can see every change in the train at once. Absent
@@ -235,6 +263,7 @@ impl Train {
             base: base.into(),
             branches: Vec::new(),
             prs: BTreeMap::new(),
+            branch_bases: BTreeMap::new(),
             aggregate: None,
         }
     }
@@ -273,6 +302,28 @@ impl Train {
     /// Position of `branch` in the train, or [`None`] if absent.
     pub fn position(&self, branch: &str) -> Option<usize> {
         self.branches.iter().position(|b| b == branch)
+    }
+
+    /// The recorded true base of `branch` — see [`Train::branch_bases`].
+    /// Callers must still verify it against the repo before acting on it.
+    pub fn branch_base(&self, branch: &str) -> Option<&str> {
+        self.branch_bases.get(branch).map(String::as_str)
+    }
+
+    /// Record `branch`'s true base.
+    ///
+    /// A no-op for a branch that isn't in the train, which keeps
+    /// [`Train::validate`]'s "no orphan keys" rule true by construction
+    /// rather than by discipline at each call site.
+    pub fn set_branch_base(&mut self, branch: &str, sha: impl Into<String>) {
+        if self.position(branch).is_some() {
+            self.branch_bases.insert(branch.to_string(), sha.into());
+        }
+    }
+
+    /// Drop `branch`'s recorded base, returning it if there was one.
+    pub fn take_branch_base(&mut self, branch: &str) -> Option<String> {
+        self.branch_bases.remove(branch)
     }
 }
 
@@ -373,6 +424,14 @@ impl Train {
             if !seen.contains(branch.as_str()) {
                 return Err(Error::CorruptState(format!(
                     "train `{}` has PR metadata for unknown branch `{}`",
+                    self.name, branch
+                )));
+            }
+        }
+        for branch in self.branch_bases.keys() {
+            if !seen.contains(branch.as_str()) {
+                return Err(Error::CorruptState(format!(
+                    "train `{}` has a recorded base for unknown branch `{}`",
                     self.name, branch
                 )));
             }
@@ -844,6 +903,64 @@ mod tests {
         store.save(&loaded).unwrap();
         let text = fs::read_to_string(dir.join("state.json")).unwrap();
         assert!(!text.contains("aggregate"), "got: {text}");
+    }
+
+    /// A state file from before recorded bases existed must load, and must not
+    /// gain a noisy empty key when rewritten — in shared mode that would be a
+    /// store commit and push of pure nothing.
+    #[test]
+    fn state_without_branch_bases_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".git/choochoo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            r#"{"version":1,"active":"t","trains":{"t":{"name":"t","base":"main","branches":["a"],"prs":{}}}}"#,
+        )
+        .unwrap();
+        let store = Store::local(tmp.path());
+        let loaded = store.load().unwrap();
+        assert!(loaded.train("t").unwrap().branch_bases.is_empty());
+        assert_eq!(loaded.train("t").unwrap().branch_base("a"), None);
+        store.save(&loaded).unwrap();
+        let text = fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(!text.contains("branch_bases"), "got: {text}");
+    }
+
+    #[test]
+    fn branch_bases_survive_save_load() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let store = Store::local(tmp.path());
+        let mut state = StateFile::default();
+        let mut train = make_train("feat", "main", &["a", "b"]);
+        train.set_branch_base("a", "sha-main");
+        train.set_branch_base("b", "sha-a");
+        state.trains.insert("feat".into(), train);
+        state.active = Some("feat".into());
+        store.save(&state).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.train("feat").unwrap().branch_base("b"), Some("sha-a"));
+    }
+
+    /// The setter is the guard for the "no orphan keys" rule in `validate`.
+    #[test]
+    fn setting_a_base_for_a_branch_outside_the_train_is_a_no_op() {
+        let mut t = make_train("feat", "main", &["a"]);
+        t.set_branch_base("ghost", "sha");
+        assert!(t.branch_bases.is_empty());
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn base_for_unknown_branch_fails_validation() {
+        let mut t = make_train("feat", "main", &["a"]);
+        t.branch_bases.insert("ghost".into(), "sha".into());
+        let mut state = StateFile::default();
+        state.trains.insert("feat".into(), t);
+        assert!(state.validate().is_err());
     }
 
     #[test]

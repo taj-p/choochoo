@@ -128,6 +128,10 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| Error::UnknownBranch(rev.to_string()))
         }
+        fn is_ancestor(&self, _a: &str, _d: &str) -> Result<bool> {
+            // Pushing never moves commits, so it never picks a boundary.
+            unreachable!()
+        }
         fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()> {
             // A rev that isn't a branch is a raw SHA, as with real git.
             let target = self

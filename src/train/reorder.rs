@@ -78,6 +78,28 @@ mod tests {
         assert_eq!(t.branches, vec!["b", "a", "c"]);
     }
 
+    /// Reordering deliberately leaves recorded bases alone. A recorded base
+    /// describes the commit a branch's *own* work sits on — a fact about that
+    /// branch's history, not about which branch is currently its parent — so
+    /// permuting the train keeps every entry both valid and correct.
+    ///
+    /// This is what makes `choo move` need no git access, and it's the reason
+    /// `remove` is different: removal deletes a link out of the chain, whereas
+    /// a move only permutes it.
+    #[test]
+    fn recorded_bases_survive_a_move_untouched() {
+        let mut t = train(&["a", "b", "c"]);
+        t.set_branch_base("a", "M");
+        t.set_branch_base("b", "A");
+        t.set_branch_base("c", "B");
+        let before = t.branch_bases.clone();
+
+        apply(&mut t, "c", Position::Before, "b").unwrap();
+
+        assert_eq!(t.branches, vec!["a", "c", "b"]);
+        assert_eq!(t.branch_bases, before);
+    }
+
     #[test]
     fn move_to_same_logical_place_is_noop() {
         let mut t = train(&["a", "b", "c"]);
