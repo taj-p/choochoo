@@ -65,6 +65,19 @@ fn push_runs_against_local_bare_remote() {
         String::from_utf8_lossy(&out.stderr),
     );
 
+    // One `git push` carried the whole train: the progress log has a
+    // single batched line, not one per branch. Real git against a real
+    // (local) remote, so this also proves `--atomic` is accepted.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pushing 2 branches") && stderr.contains("atomic"),
+        "expected one batched atomic push; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("does not support atomic push"),
+        "did not expect the sequential fallback; stderr={stderr}"
+    );
+
     // Branches present in the bare remote.
     for branch in ["a", "b"] {
         let s = Command::new("git")

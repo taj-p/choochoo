@@ -88,7 +88,7 @@ choo aggregate enable                    # branch: choo/my-feature/combined
 choo aggregate enable --branch all-of-it  # or pick your own name
 
 # From here nothing changes: push and pr handle the combined branch too.
-choo push                # pushes the train, then the combined branch
+choo push                # one push carrying the train and the combined branch
 choo pr                  # opens/updates the PRs, plus a draft combined PR
 choo rebase              # restacks the train, then re-points the combined branch
 
@@ -111,7 +111,7 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 | `choo rebase [-t <train>]` | Restack the whole train onto the current base, then re-point the combined branch (if enabled). |
 | `choo rebase --continue` | Resume after resolving conflicts and running `git rebase --continue`. |
 | `choo rebase --abort` | Cancel an in-progress rebase. |
-| `choo push [-t <train>] [--without-lease] [--no-force-with-lease] [--remote origin]` | Push every branch with `--set-upstream` so each branch tracks its remote. Default: `git push --force-with-lease`. `--without-lease` uses `git push --force` (no lease check). `--no-force-with-lease` uses plain `git push` (no force at all). |
+| `choo push [-t <train>] [--without-lease] [--no-force-with-lease] [--remote origin]` | Push every branch (and the combined branch, if enabled) in a single atomic `git push`, with `--set-upstream` so each branch tracks its remote. Default: `git push --force-with-lease`. `--without-lease` uses `git push --force` (no lease check). `--no-force-with-lease` uses plain `git push` (no force at all). |
 | `choo pr [-t <train>] [--draft]` | Create or update one PR per branch and sync the train table on every PR. Also opens/updates the combined branch's draft PR (if enabled). |
 | `choo aggregate enable [--branch <b>] [-t <train>]` | Start managing a combined branch for the train, and sync it now. |
 | `choo aggregate disable [-t <train>]` | Stop managing it. The git branch and its PR are left untouched. |

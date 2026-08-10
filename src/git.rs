@@ -89,6 +89,25 @@ pub trait GitRunner {
     /// and would have to move.
     fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()>;
     fn push(&self, branch: &str, mode: PushMode, remote: &str) -> Result<()>;
+    /// Push several branches to `remote` in a *single* `git push`.
+    ///
+    /// A train is normally pushed as a whole, and one invocation means one
+    /// connection and one ref advertisement instead of N — on a large repo
+    /// that round trip dominates the cost of `choo push`.
+    ///
+    /// `atomic` asks the remote for all-or-nothing semantics, so a stack
+    /// never lands half-pushed. Not every server implements it; callers
+    /// pair this with [`is_atomic_unsupported`] to fall back.
+    ///
+    /// An empty `branches` is a no-op rather than a bare `git push`, which
+    /// would consult `push.default` and send a ref nobody named.
+    fn push_many(
+        &self,
+        branches: &[&str],
+        mode: PushMode,
+        remote: &str,
+        atomic: bool,
+    ) -> Result<()>;
     fn fetch(&self, remote: &str) -> Result<()>;
     /// Best-effort: returns Some((ahead, behind)) if both refs are valid.
     fn ahead_behind(&self, branch: &str, upstream: &str) -> Result<Option<(u32, u32)>>;
@@ -105,6 +124,20 @@ pub trait GitRunner {
     /// Deliberately not `git checkout -b`: this runs over a whole train at
     /// once and must not move the user's working tree.
     fn create_tracking_branch(&self, branch: &str, remote: &str) -> Result<()>;
+}
+
+/// Whether a failed [`GitRunner::push_many`] failed because the remote
+/// doesn't implement the atomic-push capability — the one case where
+/// retrying the same push one branch at a time is the right move.
+///
+/// Deliberately narrow. Git says `fatal: the receiving end does not
+/// support --atomic push` for a missing capability, but words a *rejected
+/// ref* under an atomic push differently ("atomic push failed for ref
+/// ..."). Matching only the capability wording keeps a push that was
+/// refused on its merits — a stale lease, a non-fast-forward — from being
+/// quietly retried in a mode that might let half of it through.
+pub fn is_atomic_unsupported(err: &Error) -> bool {
+    matches!(err, Error::Git { stderr, .. } if stderr.contains("does not support --atomic"))
 }
 
 /// Build a `git` command with choochoo's standard environment.
@@ -317,6 +350,21 @@ impl GitRunner for ProcessGitRunner {
     }
 
     fn push(&self, branch: &str, mode: PushMode, remote: &str) -> Result<()> {
+        // Single-branch push is the batched one with a one-element batch;
+        // `--atomic` buys nothing for one ref, so it's left off.
+        self.push_many(&[branch], mode, remote, false)
+    }
+
+    fn push_many(
+        &self,
+        branches: &[&str],
+        mode: PushMode,
+        remote: &str,
+        atomic: bool,
+    ) -> Result<()> {
+        if branches.is_empty() {
+            return Ok(());
+        }
         // `--set-upstream` (a.k.a. `-u`) is included on every push: it's
         // idempotent if the upstream is already set, and it makes
         // subsequent `git status` / `git pull --rebase` / `git fetch`
@@ -324,11 +372,17 @@ impl GitRunner for ProcessGitRunner {
         // which falls back to a more permissive comparison when there's
         // no remote-tracking ref to lease against.
         let mut args: Vec<String> = vec!["push".into(), "--set-upstream".into()];
+        if atomic {
+            args.push("--atomic".into());
+        }
+        // Both force flags apply per-ref: `--force-with-lease` with no
+        // explicit expected value leases each branch against its own
+        // remote-tracking ref, so batching doesn't weaken the check.
         if let Some(flag) = mode.git_flag() {
             args.push(flag.into());
         }
         args.push(remote.to_string());
-        args.push(branch.to_string());
+        args.extend(branches.iter().map(|b| (*b).to_string()));
         self.run(args.iter().map(String::as_str))?;
         Ok(())
     }

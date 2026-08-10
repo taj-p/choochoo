@@ -627,6 +627,15 @@ mod tests {
         fn push(&self, _b: &str, _m: crate::git::PushMode, _r: &str) -> Result<()> {
             Ok(())
         }
+        fn push_many(
+            &self,
+            _b: &[&str],
+            _m: crate::git::PushMode,
+            _r: &str,
+            _atomic: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
         fn fetch(&self, _r: &str) -> Result<()> {
             Ok(())
         }

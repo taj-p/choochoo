@@ -198,6 +198,15 @@ mod tests {
         fn push(&self, _b: &str, _m: PushMode, _r: &str) -> Result<()> {
             Ok(())
         }
+        fn push_many(
+            &self,
+            _b: &[&str],
+            _m: PushMode,
+            _r: &str,
+            _atomic: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
         fn fetch(&self, remote: &str) -> Result<()> {
             self.fetched.borrow_mut().push(remote.to_string());
             Ok(())

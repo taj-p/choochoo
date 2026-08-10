@@ -426,6 +426,14 @@ pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
             if let Some(branch) = &s.aggregate_pushed {
                 writeln!(&mut out, "pushed combined branch `{branch}`").ok();
             }
+            if !s.atomic {
+                writeln!(
+                    &mut out,
+                    "note: `{remote}` does not support atomic push, so branches \
+                     were pushed one at a time"
+                )
+                .ok();
+            }
         }
         Command::Pr { train: t, draft } => {
             let gh = github::make_runner()?;

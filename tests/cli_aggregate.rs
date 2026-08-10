@@ -340,7 +340,7 @@ fn rebase_carries_the_combined_branch_to_the_new_tip() {
 }
 
 #[test]
-fn push_syncs_and_pushes_the_combined_branch_last() {
+fn push_syncs_the_combined_branch_and_sends_it_in_the_same_push() {
     let repo = TestRepo::new();
     repo.choo_ok(["init", "feat", "--base", "main", "--aggregate"]);
     three_branch_train(&repo);
@@ -364,6 +364,14 @@ fn push_syncs_and_pushes_the_combined_branch_last() {
     assert!(
         stdout.contains(&format!("pushed combined branch `{COMBINED}`")),
         "got: {stdout}"
+    );
+    // The combined branch rides along with the three train branches in a
+    // single push rather than needing a second invocation.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pushing 4 branches"),
+        "expected one push covering the train and the combined branch; \
+         stderr={stderr}"
     );
 
     let remote_sha = Command::new("git")
