@@ -129,6 +129,19 @@ impl BareRepo {
     }
 }
 
+/// A linked worktree of a [`TestRepo`], alive as long as this value is.
+pub struct Worktree {
+    /// Held only so the tempdir outlives the worktree.
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl Worktree {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// One self-contained git repo for a test, plus a path to the FakeGh JSON.
 pub struct TestRepo {
     pub dir: TempDir,
@@ -274,6 +287,31 @@ impl TestRepo {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    /// Add a linked worktree checked out at a new branch `branch`, forked
+    /// from `from`.
+    ///
+    /// It lives in its own tempdir rather than under the main working
+    /// tree, matching how people actually lay worktrees out — and making
+    /// sure nothing in the test passes by accident of the two checkouts
+    /// sharing a parent directory.
+    pub fn worktree(&self, branch: &str, from: &str) -> Worktree {
+        let dir = TempDir::new().expect("create tempdir");
+        let path = dir.path().join("wt");
+        run_git(
+            self.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().expect("utf-8 tempdir path"),
+                from,
+            ],
+        );
+        Worktree { _dir: dir, path }
+    }
+
     /// Build a `choo` command pre-configured with the repo cwd, the FakeGh
     /// env var, and a fully sandboxed environment.
     ///
@@ -293,6 +331,14 @@ impl TestRepo {
         // Ignore the developer's own git config entirely.
         c.env("GIT_CONFIG_GLOBAL", "/dev/null");
         c.env("GIT_CONFIG_SYSTEM", "/dev/null");
+        c
+    }
+
+    /// Like [`TestRepo::choo`], but run from `dir` — a linked worktree of
+    /// this repo, typically.
+    pub fn choo_from(&self, dir: &Path) -> Command {
+        let mut c = self.choo();
+        c.current_dir(dir);
         c
     }
 

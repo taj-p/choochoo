@@ -246,6 +246,11 @@ Files choochoo keeps in `.git/choochoo/`:
 | `local.json` | the active-train pointer | never |
 | `rebase-progress.json` | an interrupted rebase | never |
 
+`.git/choochoo/` means the *common* git directory, so linked worktrees of
+one repo share a set of trains, exactly as they share branches. From a
+worktree the files are under the main checkout's `.git/`, since a
+worktree's own `.git` is a file rather than a directory.
+
 `choo pr` is idempotent: it looks up existing PRs by head branch, only
 creates ones that don't exist yet, then re-renders every PR description so
 the train table is consistent across the stack.

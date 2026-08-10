@@ -114,6 +114,42 @@ pub(crate) fn git_binary() -> Result<PathBuf> {
     which::which("git").map_err(|_| Error::MissingTool("git"))
 }
 
+/// The *common* git directory for the checkout at `repo_root`: the one
+/// shared by the main checkout and all its linked worktrees.
+///
+/// [`None`] when git can't answer — no `git` on `PATH`, or a directory
+/// that only looks like a repository — so callers can fall back to the
+/// plain `<root>/.git` layout instead of failing.
+pub(crate) fn common_dir(repo_root: &Path) -> Option<PathBuf> {
+    resolve_dir(repo_root, "--git-common-dir")
+}
+
+/// This worktree's *own* git directory: `<main>/.git/worktrees/<name>` in
+/// a linked worktree, and the same thing [`common_dir`] returns otherwise.
+/// Per-worktree state — an in-progress rebase, say — lives here.
+pub(crate) fn worktree_git_dir(repo_root: &Path) -> Option<PathBuf> {
+    resolve_dir(repo_root, "--git-dir")
+}
+
+fn resolve_dir(repo_root: &Path, flag: &str) -> Option<PathBuf> {
+    let git_bin = git_binary().ok()?;
+    let out = git_command(&git_bin, repo_root)
+        .args(["rev-parse", flag])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if answer.is_empty() {
+        return None;
+    }
+    // Git answers relative to the directory we ran it in (plain `.git`, in
+    // the common case); joining makes that absolute and leaves an answer
+    // that is already absolute alone.
+    Some(repo_root.join(answer))
+}
+
 /// Production implementation of [`GitRunner`] that shells to `git`.
 pub struct ProcessGitRunner {
     repo_root: PathBuf,
@@ -201,8 +237,12 @@ impl GitRunner for ProcessGitRunner {
         } else {
             // rebase that's left in conflicted state: don't surface as Error::Git.
             // Heuristic: rebase exited non-zero but a rebase is in progress.
-            let in_rebase = self.repo_root.join(".git/rebase-apply").exists()
-                || self.repo_root.join(".git/rebase-merge").exists();
+            // A rebase is recorded in *this worktree's* git dir, which is
+            // only `<root>/.git` when the checkout isn't a linked worktree.
+            let git_dir = worktree_git_dir(&self.repo_root)
+                .unwrap_or_else(|| self.repo_root.join(".git"));
+            let in_rebase = git_dir.join("rebase-apply").exists()
+                || git_dir.join("rebase-merge").exists();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if in_rebase {
                 Ok(RebaseOutcome::Conflict { stderr })

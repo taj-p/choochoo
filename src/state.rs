@@ -401,9 +401,13 @@ impl Train {
     }
 }
 
-/// Locate the repo root (directory containing `.git`) starting from `start`.
+/// Locate the repo root (the directory holding `.git`) starting from `start`.
 ///
 /// Walks parents until either `.git` is found or we hit the filesystem root.
+/// In a linked worktree `.git` is a *file* rather than a directory; that
+/// still marks the root of a checkout, so it counts. Everything that needs
+/// the git directory itself must go through [`state_dir`], which knows the
+/// difference.
 pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
     let mut cur = if start.is_absolute() {
         start.to_path_buf()
@@ -420,9 +424,32 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Standard layout: state JSON inside `.git/choochoo/state.json`.
+/// Standard layout: choochoo's files inside `<git-common-dir>/choochoo`.
+///
+/// That is `.git/choochoo` in an ordinary checkout. In a linked worktree
+/// `<root>/.git` is a file pointing at `<main>/.git/worktrees/<name>`, so
+/// hanging a directory off it would name a path that can never exist —
+/// which is how `choo list` came to report "no trains" from every
+/// worktree. Git's *common* directory is shared by every worktree of a
+/// repo, so all of them see one set of trains, the same way they already
+/// see one set of branches.
 pub fn state_dir(repo_root: &Path) -> PathBuf {
-    repo_root.join(".git").join("choochoo")
+    git_dir(repo_root).join("choochoo")
+}
+
+/// The common git directory for `repo_root`.
+///
+/// A `.git` directory answers this by itself, and that is the case for
+/// nearly every invocation — worth not spawning a process for. Only the
+/// `.git`-as-a-file case (linked worktree, submodule) needs git to resolve
+/// the indirection, and if git can't answer we fall back to the plain
+/// layout rather than failing the command.
+fn git_dir(repo_root: &Path) -> PathBuf {
+    let plain = repo_root.join(".git");
+    if plain.is_dir() {
+        return plain;
+    }
+    crate::git::common_dir(repo_root).unwrap_or(plain)
 }
 
 /// The shared half in local mode, and the v1 file we migrate from.
