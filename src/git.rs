@@ -78,6 +78,40 @@ pub trait GitRunner {
     fn fetch(&self, remote: &str) -> Result<()>;
     /// Best-effort: returns Some((ahead, behind)) if both refs are valid.
     fn ahead_behind(&self, branch: &str, upstream: &str) -> Result<Option<(u32, u32)>>;
+    /// URL configured for `remote`, or [`None`] when there is no such
+    /// remote. A repo without an `origin` is an ordinary situation (a fresh
+    /// `git init`), so it isn't an error.
+    fn remote_url(&self, remote: &str) -> Result<Option<String>>;
+    /// Whether `refs/remotes/<remote>/<branch>` exists locally. Reflects the
+    /// last fetch, so callers fetch first.
+    fn remote_branch_exists(&self, remote: &str, branch: &str) -> Result<bool>;
+    /// Create local `branch` tracking `<remote>/<branch>`, equivalent to
+    /// `git branch --track <branch> <remote>/<branch>`.
+    ///
+    /// Deliberately not `git checkout -b`: this runs over a whole train at
+    /// once and must not move the user's working tree.
+    fn create_tracking_branch(&self, branch: &str, remote: &str) -> Result<()>;
+}
+
+/// Build a `git` command with choochoo's standard environment.
+///
+/// Shared with the state-store plumbing in [`crate::store`], which runs git
+/// against a different repository but wants the same guarantees: stable
+/// non-localized output, no pager, and — importantly — no interactive
+/// credential prompt, so a wrapper command can never hang waiting for a
+/// password nobody is there to type.
+pub(crate) fn git_command(git_bin: &Path, cwd: &Path) -> Command {
+    let mut c = Command::new(git_bin);
+    c.current_dir(cwd);
+    c.env("LC_ALL", "C");
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    c.env("GIT_PAGER", "cat");
+    c
+}
+
+/// Locate `git`, or report it as a missing tool.
+pub(crate) fn git_binary() -> Result<PathBuf> {
+    which::which("git").map_err(|_| Error::MissingTool("git"))
 }
 
 /// Production implementation of [`GitRunner`] that shells to `git`.
@@ -89,7 +123,7 @@ pub struct ProcessGitRunner {
 impl ProcessGitRunner {
     pub fn new(repo_root: impl Into<PathBuf>) -> Result<Self> {
         let repo_root = repo_root.into();
-        let git_bin = which::which("git").map_err(|_| Error::MissingTool("git"))?;
+        let git_bin = git_binary()?;
         Ok(Self { repo_root, git_bin })
     }
 
@@ -98,13 +132,7 @@ impl ProcessGitRunner {
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::new(&self.git_bin);
-        c.current_dir(&self.repo_root);
-        // Make output stable and non-localized, ignore the user's pager.
-        c.env("LC_ALL", "C");
-        c.env("GIT_TERMINAL_PROMPT", "0");
-        c.env("GIT_PAGER", "cat");
-        c
+        git_command(&self.git_bin, &self.repo_root)
     }
 
     fn run<I, S>(&self, args: I) -> Result<String>
@@ -276,5 +304,43 @@ impl GitRunner for ProcessGitRunner {
             reason: format!("ahead not a number: {e}"),
         })?;
         Ok(Some((ahead, behind)))
+    }
+
+    fn remote_url(&self, remote: &str) -> Result<Option<String>> {
+        // `git remote get-url` exits 2 for an unconfigured remote, so this
+        // deliberately checks the status itself rather than going through
+        // `run`, which would turn that into an `Error::Git`.
+        let output = self
+            .cmd()
+            .args(["remote", "get-url", remote])
+            .output()
+            .map_err(|e| Error::Io {
+                path: self.git_bin.clone(),
+                source: e,
+            })?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(if url.is_empty() { None } else { Some(url) })
+    }
+
+    fn remote_branch_exists(&self, remote: &str, branch: &str) -> Result<bool> {
+        let refname = format!("refs/remotes/{remote}/{branch}");
+        let output = self
+            .cmd()
+            .args(["show-ref", "--verify", "--quiet", &refname])
+            .output()
+            .map_err(|e| Error::Io {
+                path: self.git_bin.clone(),
+                source: e,
+            })?;
+        Ok(output.status.success())
+    }
+
+    fn create_tracking_branch(&self, branch: &str, remote: &str) -> Result<()> {
+        let start = format!("{remote}/{branch}");
+        self.run(["branch", "--track", branch, &start])?;
+        Ok(())
     }
 }

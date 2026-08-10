@@ -1,18 +1,16 @@
 //! `choo add` — append a branch to a train.
 
-use std::path::Path;
-
 use crate::error::{Error, Result};
 use crate::git::GitRunner;
-use crate::state::{self, Train};
+use crate::state::{Store, Train};
 
 pub fn run(
-    repo_root: &Path,
+    store: &Store,
     git: &dyn GitRunner,
     train_name: Option<&str>,
     branch: Option<&str>,
 ) -> Result<()> {
-    let mut state = state::load(repo_root)?;
+    let mut state = store.load()?;
     let train_name = state.resolve_train_name(train_name)?.to_string();
     let branch = match branch {
         Some(b) => b.to_string(),
@@ -22,7 +20,7 @@ pub fn run(
         return Err(Error::UnknownBranch(branch));
     }
     apply(state.train_mut(&train_name)?, &branch)?;
-    state::save(repo_root, &state)
+    store.save(&state)
 }
 
 pub(crate) fn apply(train: &mut Train, branch: &str) -> Result<()> {

@@ -1,10 +1,9 @@
 //! `choo list` and `choo show` — read-only views of trains.
 
 use std::fmt::Write;
-use std::path::Path;
 
 use crate::error::Result;
-use crate::state::{self, StateFile, Train};
+use crate::state::{StateFile, Store, Train};
 
 /// Render a one-train summary that goes to stdout.
 pub fn render_show(state: &StateFile, train_name: &str) -> Result<String> {
@@ -77,12 +76,12 @@ fn append_aggregate(out: &mut String, train: &Train) {
     );
 }
 
-pub fn run_list(repo_root: &Path) -> Result<String> {
-    Ok(render_list(&state::load(repo_root)?))
+pub fn run_list(store: &Store) -> Result<String> {
+    Ok(render_list(&store.load()?))
 }
 
-pub fn run_show(repo_root: &Path, train_name: Option<&str>) -> Result<String> {
-    let state = state::load(repo_root)?;
+pub fn run_show(store: &Store, train_name: Option<&str>) -> Result<String> {
+    let state = store.load()?;
     let name = state.resolve_train_name(train_name)?;
     render_show(&state, name)
 }

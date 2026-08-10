@@ -4,12 +4,10 @@
 //! and pushed last, so the combined PR always shows the same commits the
 //! per-branch PRs were just pushed with.
 
-use std::path::Path;
-
 use crate::error::Result;
 use crate::git::{GitRunner, PushMode};
 use crate::report::Reporter;
-use crate::state;
+use crate::state::Store;
 use crate::train::aggregate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,14 +20,14 @@ pub struct PushSummary {
 }
 
 pub fn run(
-    repo_root: &Path,
+    store: &Store,
     git: &dyn GitRunner,
     reporter: &mut dyn Reporter,
     train_name: Option<&str>,
     mode: PushMode,
     remote: &str,
 ) -> Result<PushSummary> {
-    let mut state = state::load(repo_root)?;
+    let mut state = store.load()?;
     let train_name = state.resolve_train_name(train_name)?.to_string();
     let branches = state.train(&train_name)?.branches.clone();
     let total = branches.len();
@@ -88,7 +86,7 @@ pub fn run(
         aggregate_pushed = Some(outcome.branch);
     }
 
-    state::save(repo_root, &state)?;
+    store.save(&state)?;
     Ok(PushSummary {
         train: train_name,
         pushed,
@@ -161,11 +159,25 @@ mod tests {
         fn ahead_behind(&self, _b: &str, _u: &str) -> Result<Option<(u32, u32)>> {
             Ok(None)
         }
+        fn remote_url(&self, _r: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        /// These fixtures model repos where every branch is already
+        /// local, so the remote-branch paths are never taken. Stubbed
+        /// explicitly rather than defaulted: a default `Ok(false)` would
+        /// quietly assert something untrue about the fixture.
+        fn remote_branch_exists(&self, _r: &str, _b: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn create_tracking_branch(&self, _b: &str, _r: &str) -> Result<()> {
+            unreachable!("fixture branches are always local")
+        }
     }
 
-    fn setup() -> (TempDir, FakeGit) {
+    fn setup() -> (TempDir, Store, FakeGit) {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git/choochoo")).unwrap();
+        let store = Store::local(tmp.path());
 
         let mut state = StateFile::default();
         let mut t = Train::new("t", "main");
@@ -181,7 +193,7 @@ mod tests {
         );
         state.trains.insert("t".into(), t);
         state.active = Some("t".into());
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
 
         let git = FakeGit {
             tips: RefCell::new(
@@ -192,22 +204,22 @@ mod tests {
             ),
             pushes: RefCell::new(Vec::new()),
         };
-        (tmp, git)
+        (tmp, store, git)
     }
 
     /// Turn on the aggregate branch for the fixture train.
-    fn enable_aggregate(tmp: &TempDir, branch: &str) {
-        let mut state = state::load(tmp.path()).unwrap();
+    fn enable_aggregate(store: &Store, branch: &str) {
+        let mut state = store.load().unwrap();
         state.train_mut("t").unwrap().aggregate =
             Some(crate::state::Aggregate::new(branch));
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
     }
 
     #[test]
     fn pushes_every_branch_with_force_with_lease() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         let summary = run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -228,9 +240,9 @@ mod tests {
 
     #[test]
     fn force_mode_passes_unconditional_force_to_git() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -244,9 +256,9 @@ mod tests {
 
     #[test]
     fn plain_mode_passes_no_force_flag_to_git() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -260,9 +272,9 @@ mod tests {
 
     #[test]
     fn updates_last_pushed_sha_for_branches_with_prs() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -270,7 +282,7 @@ mod tests {
             "origin",
         )
         .unwrap();
-        let state = state::load(tmp.path()).unwrap();
+        let state = store.load().unwrap();
         let train = state.train("t").unwrap();
         assert_eq!(
             train.prs.get("a").unwrap().last_pushed_sha.as_deref(),
@@ -280,10 +292,10 @@ mod tests {
 
     #[test]
     fn emits_one_progress_step_per_branch() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         let mut rep = RecordingReporter::new();
         run(
-            tmp.path(),
+            &store,
             &git,
             &mut rep,
             None,
@@ -302,10 +314,10 @@ mod tests {
 
     #[test]
     fn aggregate_branch_is_synced_then_pushed_last() {
-        let (tmp, git) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
+        let (_tmp, store, git) = setup();
+        enable_aggregate(&store, "choo/t/combined");
         let summary = run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -329,19 +341,20 @@ mod tests {
 
     #[test]
     fn aggregate_pr_records_the_pushed_sha() {
-        let (tmp, git) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
-        let mut state = state::load(tmp.path()).unwrap();
+        let (_tmp, store, git) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        let mut state = store.load().unwrap();
         state.train_mut("t").unwrap().aggregate.as_mut().unwrap().pr = Some(PrInfo {
             number: 9,
             url: "u".into(),
             title: None,
             last_pushed_sha: None,
         });
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
 
         run(
-            tmp.path(),
+
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -350,16 +363,16 @@ mod tests {
         )
         .unwrap();
 
-        let state = state::load(tmp.path()).unwrap();
+        let state = store.load().unwrap();
         let agg = state.train("t").unwrap().aggregate.clone().unwrap();
         assert_eq!(agg.pr.unwrap().last_pushed_sha.as_deref(), Some("B1"));
     }
 
     #[test]
     fn no_aggregate_means_nothing_extra_is_pushed() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         let summary = run(
-            tmp.path(),
+            &store,
             &git,
             &mut NullReporter,
             None,
@@ -373,10 +386,10 @@ mod tests {
 
     #[test]
     fn force_mode_status_label_in_progress() {
-        let (tmp, git) = setup();
+        let (_tmp, store, git) = setup();
         let mut rep = RecordingReporter::new();
         run(
-            tmp.path(),
+            &store,
             &git,
             &mut rep,
             None,

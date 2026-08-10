@@ -18,13 +18,12 @@
 //! created. Step 3 is also idempotent because [`render::rerender_pr_body`]
 //! produces the same output for the same input.
 
-use std::path::Path;
 
 use crate::error::Result;
 use crate::github::GhRunner;
 use crate::render;
 use crate::report::Reporter;
-use crate::state::{self, PrInfo, Train};
+use crate::state::{PrInfo, Store, Train};
 use crate::train::aggregate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,13 +70,13 @@ fn record_title(train: &mut Train, branch: &str, title: Option<String>) {
 }
 
 pub fn run(
-    repo_root: &Path,
+    store: &Store,
     gh: &dyn GhRunner,
     reporter: &mut dyn Reporter,
     train_name: Option<&str>,
     draft: bool,
 ) -> Result<PrSummary> {
-    let mut state = state::load(repo_root)?;
+    let mut state = store.load()?;
     let train_name = state.resolve_train_name(train_name)?.to_string();
 
     let pairs: Vec<(String, String)> = state
@@ -221,7 +220,7 @@ pub fn run(
         .aggregate
         .as_ref()
         .and_then(|a| a.pr.clone());
-    state::save(repo_root, &state)?;
+    store.save(&state)?;
     Ok(PrSummary {
         train: train_name,
         created,
@@ -235,48 +234,49 @@ mod tests {
     use super::*;
     use crate::github::FakeGh;
     use crate::report::{NullReporter, RecordingReporter};
-    use crate::state::{StateFile, Train};
+    use crate::state::{StateFile, Store, Train};
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, FakeGh) {
+    fn setup() -> (TempDir, Store, FakeGh) {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git/choochoo")).unwrap();
+        let store = Store::local(tmp.path());
         let mut state = StateFile::default();
         let mut t = Train::new("t", "main");
         t.branches = vec!["a".into(), "b".into(), "c".into()];
         state.trains.insert("t".into(), t);
         state.active = Some("t".into());
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
 
         let gh = FakeGh::open(tmp.path().join(".git/choochoo/gh.json")).unwrap();
-        (tmp, gh)
+        (tmp, store, gh)
     }
 
     #[test]
     fn first_run_creates_one_pr_per_branch() {
-        let (tmp, gh) = setup();
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert_eq!(summary.created, vec!["a", "b", "c"]);
         assert_eq!(summary.updated.len(), 3);
 
-        let state = state::load(tmp.path()).unwrap();
+        let state = store.load().unwrap();
         let prs = &state.train("t").unwrap().prs;
         assert_eq!(prs.len(), 3);
     }
 
     /// Enable the aggregate branch on the fixture train.
-    fn enable_aggregate(tmp: &TempDir, branch: &str) {
-        let mut state = state::load(tmp.path()).unwrap();
+    fn enable_aggregate(store: &Store, branch: &str) {
+        let mut state = store.load().unwrap();
         state.train_mut("t").unwrap().aggregate =
             Some(crate::state::Aggregate::new(branch));
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
     }
 
     #[test]
     fn aggregate_gets_a_draft_pr_against_the_base() {
-        let (tmp, gh) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert_eq!(summary.created, vec!["a", "b", "c", "choo/t/combined"]);
 
         let raw = std::fs::read_to_string(gh.path()).unwrap();
@@ -296,9 +296,9 @@ mod tests {
     /// either way, because it isn't the thing being merged.
     #[test]
     fn aggregate_pr_is_a_draft_even_when_branch_prs_are_not() {
-        let (tmp, gh) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
-        run(tmp.path(), &gh, &mut NullReporter, None, /* draft */ false).unwrap();
+        let (_tmp, store, gh) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        run(&store, &gh, &mut NullReporter, None, /* draft */ false).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(gh.path()).unwrap()).unwrap();
         assert_eq!(parsed["prs"]["a"]["draft"], false);
@@ -307,10 +307,10 @@ mod tests {
 
     #[test]
     fn aggregate_run_is_also_idempotent() {
-        let (tmp, gh) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert!(summary.created.is_empty());
         assert!(
             summary.updated.is_empty(),
@@ -321,9 +321,9 @@ mod tests {
 
     #[test]
     fn aggregate_row_appears_in_every_pr_body() {
-        let (tmp, gh) = setup();
-        enable_aggregate(&tmp, "choo/t/combined");
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        enable_aggregate(&store, "choo/t/combined");
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(gh.path()).unwrap()).unwrap();
         for branch in ["a", "b", "c", "choo/t/combined"] {
@@ -346,15 +346,16 @@ mod tests {
     fn empty_train_with_aggregate_creates_no_prs() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git/choochoo")).unwrap();
+        let store = Store::local(tmp.path());
         let mut state = StateFile::default();
         let mut t = Train::new("t", "main");
         t.aggregate = Some(crate::state::Aggregate::new("choo/t/combined"));
         state.trains.insert("t".into(), t);
         state.active = Some("t".into());
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
         let gh = FakeGh::open(tmp.path().join(".git/choochoo/gh.json")).unwrap();
 
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert!(summary.created.is_empty());
         assert!(summary.aggregate_pr.is_none());
         assert!(gh.find_pr_for_branch("choo/t/combined").unwrap().is_none());
@@ -365,9 +366,9 @@ mod tests {
         // After the first run, every PR's body is already in sync with the
         // train state. The second run must therefore neither create nor
         // update anything: this is what makes `choo pr` safe to re-run.
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert!(summary.created.is_empty());
         assert!(
             summary.updated.is_empty(),
@@ -378,8 +379,8 @@ mod tests {
 
     #[test]
     fn pr_for_first_branch_targets_base() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let s = gh.path();
         let raw = std::fs::read_to_string(s).unwrap();
         // PR for "a" should have base "main"; PR for "b" should have base "a".
@@ -396,8 +397,8 @@ mod tests {
 
     #[test]
     fn pr_body_contains_train_table_with_self_marker() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let raw = std::fs::read_to_string(gh.path()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let body_b = parsed["prs"]["b"]["body"].as_str().unwrap().to_string();
@@ -415,12 +416,12 @@ mod tests {
     /// between the `<!-- choochoo:body:* -->` markers must round-trip.
     #[test]
     fn second_run_preserves_user_body_between_markers() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
 
         // User edits PR `b`'s body via the GitHub UI: they write a
         // description between the markers and a stray comment outside.
-        let state = state::load(tmp.path()).unwrap();
+        let state = store.load().unwrap();
         let pr_b = state.train("t").unwrap().prs.get("b").cloned().unwrap();
         let edited = format!(
             "<!-- choochoo:train name=\"t\" -->\n\
@@ -443,7 +444,7 @@ mod tests {
         gh.update_pr_body(pr_b.number, &edited).unwrap();
 
         // Re-run `choo pr`. The user content must survive verbatim.
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
 
         let after = gh.get_pr(pr_b.number).unwrap().body;
         assert!(
@@ -461,9 +462,9 @@ mod tests {
     fn emits_two_progress_steps_per_branch() {
         // Once for "ensuring PR" (step 1) and once for "syncing description"
         // (step 2). For three branches that's six events.
-        let (tmp, gh) = setup();
+        let (_tmp, store, gh) = setup();
         let mut rep = RecordingReporter::new();
-        run(tmp.path(), &gh, &mut rep, None, false).unwrap();
+        run(&store, &gh, &mut rep, None, false).unwrap();
         assert_eq!(rep.events.len(), 6, "events: {:?}", rep.events);
         assert!(rep.events[0].starts_with("ensuring PR for `a`"));
         assert!(rep.events[0].contains("(1/3)"));
@@ -474,10 +475,10 @@ mod tests {
 
     #[test]
     fn second_run_progress_says_unchanged() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let mut rep = RecordingReporter::new();
-        run(tmp.path(), &gh, &mut rep, None, false).unwrap();
+        run(&store, &gh, &mut rep, None, false).unwrap();
         // Ensuring step says "already exists" (#1, #2, #3); syncing says
         // "unchanged" because the body matches.
         let joined = rep.joined();
@@ -490,9 +491,9 @@ mod tests {
     /// the end so the user's description stays prominent at the top.
     #[test]
     fn second_run_appends_block_to_foreign_body() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
-        let pr_a = state::load(tmp.path())
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        let pr_a = store.load()
             .unwrap()
             .train("t")
             .unwrap()
@@ -504,7 +505,7 @@ mod tests {
         let foreign = "I wrote this manually before choochoo synced this PR.";
         gh.update_pr_body(pr_a.number, foreign).unwrap();
 
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let after = gh.get_pr(pr_a.number).unwrap().body;
         assert!(after.starts_with(foreign), "foreign body lost: {after}");
         assert!(after.contains(crate::render::TRAIN_START));
@@ -515,15 +516,15 @@ mod tests {
     /// train table on the next `choo pr` run.
     #[test]
     fn renamed_title_propagates_into_train_tables() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
 
         // PR #1 (head=`a`) gets renamed by the user via the GitHub UI.
         gh.set_pr_title(1, "Refactor widget store").unwrap();
 
         // Next `choo pr` should pick that up and rewrite *every* PR's
         // body so the train table on PRs #2/#3 also shows the new title.
-        let summary = run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        let summary = run(&store, &gh, &mut NullReporter, None, false).unwrap();
         assert!(
             summary.updated.len() == 3,
             "all bodies should re-render to show new title; got: {:?}",
@@ -546,7 +547,7 @@ mod tests {
         }
 
         // And the rename is now persisted in choochoo state too.
-        let st = state::load(tmp.path()).unwrap();
+        let st = store.load().unwrap();
         assert_eq!(
             st.train("t").unwrap().prs.get("a").unwrap().title.as_deref(),
             Some("Refactor widget store")
@@ -562,9 +563,9 @@ mod tests {
     /// prose must survive AND the legacy markers must be migrated away.
     #[test]
     fn second_run_rescues_prose_above_legacy_block() {
-        let (tmp, gh) = setup();
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
-        let pr_b = state::load(tmp.path())
+        let (_tmp, store, gh) = setup();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
+        let pr_b = store.load()
             .unwrap()
             .train("t")
             .unwrap()
@@ -593,7 +594,7 @@ mod tests {
         );
         gh.update_pr_body(pr_b.number, &edited).unwrap();
 
-        run(tmp.path(), &gh, &mut NullReporter, None, false).unwrap();
+        run(&store, &gh, &mut NullReporter, None, false).unwrap();
         let after = gh.get_pr(pr_b.number).unwrap().body;
         assert!(
             after.starts_with("Hello there"),

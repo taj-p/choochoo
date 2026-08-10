@@ -51,6 +51,27 @@ pub enum Error {
     #[error("branch `{0}` does not exist locally")]
     UnknownBranch(String),
 
+    #[error(
+        "train `{train}` is missing branches here and on `{remote}`: {}",
+        missing.join(", ")
+    )]
+    IncompleteTrain {
+        train: String,
+        remote: String,
+        missing: Vec<String>,
+    },
+
+    #[error(
+        "branch `{branch}` is in train `{train}` but exists neither locally \
+         nor on `{remote}`; run `git fetch {remote}` if it was pushed from \
+         another machine"
+    )]
+    BranchNotFetched {
+        train: String,
+        branch: String,
+        remote: String,
+    },
+
     #[error("no active train; pass --train or run `choo switch <name>`")]
     NoActiveTrain,
 
@@ -62,6 +83,28 @@ pub enum Error {
 
     #[error("state file is corrupted: {0}")]
     CorruptState(String),
+
+    #[error("config at {path} is invalid: {reason}")]
+    Config { path: PathBuf, reason: String },
+
+    #[error("shared train state is unavailable: {0}")]
+    StoreUnavailable(String),
+
+    #[error("could not sync shared train state: {0}")]
+    StoreSync(String),
+
+    #[error(
+        "another `choo` is using the shared train state (lock: {path}); \
+         retry in a moment"
+    )]
+    StoreLocked { path: PathBuf },
+
+    #[error(
+        "this repository has no `{remote}` remote, so choochoo cannot tell \
+         which repository's trains to load from shared state; add the remote, \
+         or run with --no-sync"
+    )]
+    NoRepoIdentity { remote: String },
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

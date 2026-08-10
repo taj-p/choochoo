@@ -1,7 +1,6 @@
 //! Interactive ratatui-based UI.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -14,7 +13,7 @@ use crate::error::Result;
 use crate::git::{ProcessGitRunner, PushMode};
 use crate::github;
 use crate::report::Reporter;
-use crate::state;
+use crate::state::Store;
 use crate::train;
 
 pub mod app;
@@ -54,20 +53,41 @@ impl Reporter for LatestStatusReporter {
 }
 
 /// Launch the TUI bound to a real terminal.
-pub fn run(repo_root: &Path) -> Result<()> {
-    let state = state::load(repo_root)?;
+pub fn run(store: &Store) -> Result<()> {
+    let state = store.load()?;
     let mut app = App::new(state);
+    show_store_warnings(&mut app, store);
 
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, &mut app, repo_root);
+    let result = run_loop(&mut terminal, &mut app, store);
     ratatui::restore();
+    // Anything left unshown goes to stderr now that the alternate screen is
+    // gone — a warning the user never saw would defeat the point.
+    for warning in store.take_warnings() {
+        eprintln!("warning: {warning}");
+    }
     result
+}
+
+/// Fold any sync degradation into the status line.
+///
+/// The TUI holds the alternate screen, so writing warnings to stderr while
+/// it is up would scribble over the display. They have to come through the
+/// UI's own channel.
+fn show_store_warnings(app: &mut App, store: &Store) {
+    for warning in store.take_warnings() {
+        app.status = if app.status.is_empty() {
+            format!("warning: {warning}")
+        } else {
+            format!("{} | warning: {warning}", app.status)
+        };
+    }
 }
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    repo_root: &Path,
+    store: &Store,
 ) -> Result<()> {
     loop {
         terminal
@@ -82,8 +102,15 @@ fn run_loop(
             Effect::Quit => return Ok(()),
             Effect::None => {}
             Effect::Checkout { branch, .. } => {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
-                match train::checkout::run(repo_root, &git, None, &branch) {
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
+                match train::checkout::run(
+                    store,
+                    &git,
+                    &mut LatestStatusReporter::default(),
+                    None,
+                    &branch,
+                    "origin",
+                ) {
                     Ok(()) => {
                         app.status = format!("checked out `{branch}`");
                     }
@@ -93,9 +120,9 @@ fn run_loop(
                 }
             }
             Effect::Rebase { train: t } => {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
                 let mut rep = LatestStatusReporter::default();
-                match train::rebase::run(repo_root, &git, &mut rep, Some(&t)) {
+                match train::rebase::run(store, &git, &mut rep, Some(&t)) {
                     Ok(s) => {
                         app.status = format!("rebased {} branch(es)", s.rebased.len());
                     }
@@ -106,13 +133,14 @@ fn run_loop(
                         };
                     }
                 }
-                app.reload(repo_root)?;
+                app.reload(store)?;
+                show_store_warnings(app, store);
             }
             Effect::Push { train: t } => {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
                 let mut rep = LatestStatusReporter::default();
                 match train::push::run(
-                    repo_root,
+                    store,
                     &git,
                     &mut rep,
                     Some(&t),
@@ -127,12 +155,13 @@ fn run_loop(
                         };
                     }
                 }
-                app.reload(repo_root)?;
+                app.reload(store)?;
+                show_store_warnings(app, store);
             }
             Effect::OpenPr { train: t } => {
                 let gh = github::make_runner()?;
                 let mut rep = LatestStatusReporter::default();
-                match train::pr::run(repo_root, gh.as_ref(), &mut rep, Some(&t), false) {
+                match train::pr::run(store, gh.as_ref(), &mut rep, Some(&t), false) {
                     Ok(s) => {
                         app.status = format!(
                             "PRs: {} created, {} updated",
@@ -147,7 +176,8 @@ fn run_loop(
                         };
                     }
                 }
-                app.reload(repo_root)?;
+                app.reload(store)?;
+                show_store_warnings(app, store);
             }
             Effect::Reorder {
                 train: t,
@@ -156,7 +186,7 @@ fn run_loop(
                 relative_to,
             } => {
                 match train::reorder::run(
-                    repo_root,
+                    store,
                     Some(&t),
                     &branch,
                     position,
@@ -165,7 +195,8 @@ fn run_loop(
                     Ok(()) => app.status = format!("moved `{branch}`"),
                     Err(e) => app.status = format!("move failed: {e}"),
                 }
-                app.reload(repo_root)?;
+                app.reload(store)?;
+                show_store_warnings(app, store);
             }
         }
     }

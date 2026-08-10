@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::git::{GitRunner, RebaseOutcome};
 use crate::report::Reporter;
-use crate::state::{self, StateFile, Train};
+use crate::state::{self, StateFile, Store, Train};
 
 /// Persisted state of an in-progress (or interrupted) rebase. Lives at
 /// `.git/choochoo/rebase-progress.json`.
@@ -115,19 +115,19 @@ pub fn build_plan(train: &Train, snapshot: &BTreeMap<String, String>) -> Result<
 /// Initial entry point. Errors with [`Error::RebaseConflict`] on conflict;
 /// caller is then expected to call [`continue_run`] after they resolve.
 pub fn run(
-    repo_root: &Path,
+    store: &Store,
     git: &dyn GitRunner,
     reporter: &mut dyn Reporter,
     train_name: Option<&str>,
 ) -> Result<RebaseOutcomeSummary> {
-    if load_progress(repo_root)?.is_some() {
+    if load_progress(store.repo_root())?.is_some() {
         return Err(Error::InvalidArgument(
             "a rebase is already in progress; run `choo rebase --continue` or \
              `choo rebase --abort`".into(),
         ));
     }
 
-    let mut state = state::load(repo_root)?;
+    let mut state = store.load()?;
     let train_name = state.resolve_train_name(train_name)?.to_string();
     let snapshot = take_snapshot(git, state.train(&train_name)?)?;
 
@@ -136,20 +136,20 @@ pub fn run(
         snapshot,
         next_pair: 0,
     };
-    save_progress(repo_root, &progress)?;
+    save_progress(store.repo_root(), &progress)?;
 
-    drive(repo_root, git, reporter, &mut state, progress)
+    drive(store, git, reporter, &mut state, progress)
 }
 
 /// Resume an in-progress rebase. Assumes the user has already run
 /// `git rebase --continue` (or completed conflict resolution another way)
 /// and wants choochoo to pick up the next branch.
 pub fn continue_run(
-    repo_root: &Path,
+    store: &Store,
     git: &dyn GitRunner,
     reporter: &mut dyn Reporter,
 ) -> Result<RebaseOutcomeSummary> {
-    let progress = load_progress(repo_root)?.ok_or_else(|| {
+    let progress = load_progress(store.repo_root())?.ok_or_else(|| {
         Error::InvalidArgument("no rebase in progress".into())
     })?;
     // Advance past the conflicted pair (assumed resolved).
@@ -157,22 +157,22 @@ pub fn continue_run(
         next_pair: progress.next_pair + 1,
         ..progress
     };
-    save_progress(repo_root, &progress)?;
-    let mut state = state::load(repo_root)?;
-    drive(repo_root, git, reporter, &mut state, progress)
+    save_progress(store.repo_root(), &progress)?;
+    let mut state = store.load()?;
+    drive(store, git, reporter, &mut state, progress)
 }
 
 /// Abort an in-progress rebase: tell git to abort, drop the progress file.
-pub fn abort(repo_root: &Path, git: &dyn GitRunner) -> Result<()> {
+pub fn abort(store: &Store, git: &dyn GitRunner) -> Result<()> {
     git.rebase_abort()?;
-    clear_progress(repo_root)?;
+    clear_progress(store.repo_root())?;
     Ok(())
 }
 
 /// Drive the plan from `progress.next_pair` to the end. Persists progress
 /// after each successful step so an unexpected crash doesn't lose state.
 fn drive(
-    repo_root: &Path,
+    store: &Store,
     git: &dyn GitRunner,
     reporter: &mut dyn Reporter,
     state: &mut StateFile,
@@ -208,11 +208,11 @@ fn drive(
                 reporter.ok("");
                 summary.rebased.push(step.child.clone());
                 progress.next_pair += 1;
-                save_progress(repo_root, &progress)?;
+                save_progress(store.repo_root(), &progress)?;
             }
             RebaseOutcome::Conflict { stderr: _ } => {
                 reporter.fail("conflict");
-                save_progress(repo_root, &progress)?;
+                save_progress(store.repo_root(), &progress)?;
                 return Err(Error::RebaseConflict {
                     branch: step.child.clone(),
                 });
@@ -228,7 +228,7 @@ fn drive(
     }
     summary.aggregate_synced = aggregate_synced;
 
-    clear_progress(repo_root)?;
+    clear_progress(store.repo_root())?;
     Ok(summary)
 }
 
@@ -391,11 +391,25 @@ mod tests {
         fn ahead_behind(&self, _b: &str, _u: &str) -> Result<Option<(u32, u32)>> {
             Ok(None)
         }
+        fn remote_url(&self, _r: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        /// These fixtures model repos where every branch is already
+        /// local, so the remote-branch paths are never taken. Stubbed
+        /// explicitly rather than defaulted: a default `Ok(false)` would
+        /// quietly assert something untrue about the fixture.
+        fn remote_branch_exists(&self, _r: &str, _b: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn create_tracking_branch(&self, _b: &str, _r: &str) -> Result<()> {
+            unreachable!("fixture branches are always local")
+        }
     }
 
-    fn fake_repo() -> (TempDir, FakeGit, StateFile) {
+    fn fake_repo() -> (TempDir, Store, FakeGit, StateFile) {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".git/choochoo")).unwrap();
+        let store = Store::local(tmp.path());
         let git = FakeGit::new(&[
             ("main", "M"),
             ("a", "A"),
@@ -407,14 +421,14 @@ mod tests {
         t.branches = vec!["a".into(), "b".into(), "c".into()];
         state.trains.insert("t".into(), t);
         state.active = Some("t".into());
-        state::save(tmp.path(), &state).unwrap();
-        (tmp, git, state)
+        store.save(&state).unwrap();
+        (tmp, store, git, state)
     }
 
     #[test]
     fn happy_path_rebases_all_branches() {
-        let (tmp, git, _) = fake_repo();
-        let summary = run(tmp.path(), &git, &mut NullReporter, None).unwrap();
+        let (_tmp, store, git, _) = fake_repo();
+        let summary = run(&store, &git, &mut NullReporter, None).unwrap();
         assert_eq!(summary.rebased, vec!["a", "b", "c"]);
         // Verify the right rebase calls happened with the snapshot upstreams.
         let calls = git.rebase_calls.borrow().clone();
@@ -427,22 +441,22 @@ mod tests {
                 ("c".into(), "M+a+b".into(), "B".into()),
             ]
         );
-        assert!(!progress_path(tmp.path()).exists());
+        assert!(!progress_path(store.repo_root()).exists());
     }
 
     /// Enable the aggregate branch on the fixture train.
-    fn enable_aggregate(tmp: &TempDir, branch: &str) {
-        let mut state = state::load(tmp.path()).unwrap();
+    fn enable_aggregate(store: &Store, branch: &str) {
+        let mut state = store.load().unwrap();
         state.train_mut("t").unwrap().aggregate =
             Some(crate::state::Aggregate::new(branch));
-        state::save(tmp.path(), &state).unwrap();
+        store.save(&state).unwrap();
     }
 
     #[test]
     fn aggregate_branch_follows_the_restacked_tip() {
-        let (tmp, git, _) = fake_repo();
-        enable_aggregate(&tmp, "choo/t/combined");
-        let summary = run(tmp.path(), &git, &mut NullReporter, None).unwrap();
+        let (_tmp, store, git, _) = fake_repo();
+        enable_aggregate(&store, "choo/t/combined");
+        let summary = run(&store, &git, &mut NullReporter, None).unwrap();
         assert_eq!(
             summary.aggregate_synced.as_deref(),
             Some("choo/t/combined")
@@ -454,10 +468,10 @@ mod tests {
 
     #[test]
     fn aggregate_branch_is_not_synced_while_a_conflict_is_unresolved() {
-        let (tmp, git, _) = fake_repo();
-        enable_aggregate(&tmp, "choo/t/combined");
+        let (_tmp, store, git, _) = fake_repo();
+        enable_aggregate(&store, "choo/t/combined");
         *git.force_conflict_on.borrow_mut() = Some("b".into());
-        let _ = run(tmp.path(), &git, &mut NullReporter, None);
+        let _ = run(&store, &git, &mut NullReporter, None);
         assert!(
             !git.branch_exists("choo/t/combined").unwrap(),
             "a half-restacked train must not update the combined branch"
@@ -468,7 +482,7 @@ mod tests {
         git.tips
             .borrow_mut()
             .insert("b".into(), "M+a+b-resolved".into());
-        let summary = continue_run(tmp.path(), &git, &mut NullReporter).unwrap();
+        let summary = continue_run(&store, &git, &mut NullReporter).unwrap();
         assert_eq!(
             summary.aggregate_synced.as_deref(),
             Some("choo/t/combined")
@@ -481,13 +495,13 @@ mod tests {
 
     #[test]
     fn conflict_preserves_progress_file() {
-        let (tmp, git, _) = fake_repo();
+        let (_tmp, store, git, _) = fake_repo();
         *git.force_conflict_on.borrow_mut() = Some("b".into());
 
-        let err = run(tmp.path(), &git, &mut NullReporter, None).unwrap_err();
+        let err = run(&store, &git, &mut NullReporter, None).unwrap_err();
         assert!(matches!(err, Error::RebaseConflict { ref branch } if branch == "b"));
 
-        let prog = load_progress(tmp.path()).unwrap().unwrap();
+        let prog = load_progress(store.repo_root()).unwrap().unwrap();
         assert_eq!(prog.train, "t");
         assert_eq!(prog.next_pair, 1);
 
@@ -498,36 +512,36 @@ mod tests {
             .borrow_mut()
             .insert("b".into(), "M+a+b-resolved".into());
 
-        let summary = continue_run(tmp.path(), &git, &mut NullReporter).unwrap();
+        let summary = continue_run(&store, &git, &mut NullReporter).unwrap();
         assert_eq!(summary.rebased, vec!["c"]);
-        assert!(!progress_path(tmp.path()).exists());
+        assert!(!progress_path(store.repo_root()).exists());
     }
 
     #[test]
     fn second_run_while_in_progress_errors() {
-        let (tmp, git, _) = fake_repo();
+        let (_tmp, store, git, _) = fake_repo();
         *git.force_conflict_on.borrow_mut() = Some("a".into());
-        let _ = run(tmp.path(), &git, &mut NullReporter, None);
+        let _ = run(&store, &git, &mut NullReporter, None);
         // Don't clear; simulate user trying to start over.
-        let err = run(tmp.path(), &git, &mut NullReporter, None).unwrap_err();
+        let err = run(&store, &git, &mut NullReporter, None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     #[test]
     fn abort_clears_progress() {
-        let (tmp, git, _) = fake_repo();
+        let (_tmp, store, git, _) = fake_repo();
         *git.force_conflict_on.borrow_mut() = Some("a".into());
-        let _ = run(tmp.path(), &git, &mut NullReporter, None);
-        assert!(progress_path(tmp.path()).exists());
-        abort(tmp.path(), &git).unwrap();
-        assert!(!progress_path(tmp.path()).exists());
+        let _ = run(&store, &git, &mut NullReporter, None);
+        assert!(progress_path(store.repo_root()).exists());
+        abort(&store, &git).unwrap();
+        assert!(!progress_path(store.repo_root()).exists());
     }
 
     #[test]
     fn emits_one_progress_step_per_branch() {
-        let (tmp, git, _) = fake_repo();
+        let (_tmp, store, git, _) = fake_repo();
         let mut rep = RecordingReporter::new();
-        run(tmp.path(), &git, &mut rep, None).unwrap();
+        run(&store, &git, &mut rep, None).unwrap();
         assert_eq!(rep.events.len(), 3, "events: {:?}", rep.events);
         assert!(rep.events[0].contains("rebasing `a` onto `main`"));
         assert!(rep.events[0].contains("(1/3)"));
@@ -538,10 +552,10 @@ mod tests {
 
     #[test]
     fn conflict_step_is_marked_failed_in_progress() {
-        let (tmp, git, _) = fake_repo();
+        let (_tmp, store, git, _) = fake_repo();
         *git.force_conflict_on.borrow_mut() = Some("b".into());
         let mut rep = RecordingReporter::new();
-        let _ = run(tmp.path(), &git, &mut rep, None);
+        let _ = run(&store, &git, &mut rep, None);
         let joined = rep.joined();
         assert!(joined.contains("rebasing `a`"));
         assert!(joined.contains("ok"));

@@ -6,7 +6,7 @@
 //! and view-state.
 
 use crate::error::Result;
-use crate::state::{self, StateFile};
+use crate::state::{StateFile, Store};
 
 /// Logical key actions, normalized from raw crossterm events. The
 /// translation lives in [`super::keymap`].
@@ -65,9 +65,9 @@ impl App {
         }
     }
 
-    /// Reload state from disk (after side effects mutate it).
-    pub fn reload(&mut self, repo_root: &std::path::Path) -> Result<()> {
-        self.state = state::load(repo_root)?;
+    /// Reload state from the store (after side effects mutate it).
+    pub fn reload(&mut self, store: &Store) -> Result<()> {
+        self.state = store.load()?;
         // Re-validate the current selection.
         match &mut self.view {
             View::TrainsList { selected } => {

@@ -39,6 +39,10 @@ cargo build --release
 `choo` requires `git` and `gh` on `PATH`. GitHub authentication is reused
 from your existing `gh auth login`.
 
+Configuration is optional and lives at `~/.config/choochoo/config.toml`
+(`$XDG_CONFIG_HOME` is honoured; the path is the same on macOS and Linux).
+Its only job is [sharing state across machines](#sharing-state-across-machines).
+
 ## Quickstart
 
 ```bash
@@ -111,7 +115,12 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 | `choo aggregate enable [--branch <b>] [-t <train>]` | Start managing a combined branch for the train, and sync it now. |
 | `choo aggregate disable [-t <train>]` | Stop managing it. The git branch and its PR are left untouched. |
 | `choo aggregate sync [-t <train>]` | Re-point the combined branch at the train's current tip. |
+| `choo fetch [<train>] [--remote origin]` | Create a local tracking branch for every branch in the train that isn't here yet. Use it on a second machine. |
+| `choo sync [--status]` | Show where shared state lives and publish anything pending. `--status` reports without touching the network. |
 | `choo tui` | Launch the interactive UI. |
+
+`--no-sync` works on any command: read the last-synced copy of shared state
+and keep changes local, publishing them on your next synced command.
 
 `-t/--train` defaults to the **active** train (set by `choo init` for the
 first train, or `choo switch <name>`).
@@ -134,10 +143,87 @@ A train's combined branch (if enabled) is listed after its branches as a
 dimmed `Σ` row. It isn't selectable — `R` / `P` / `O` keep it in sync for
 you, and it's configured from the CLI (`choo aggregate ...`).
 
+## Sharing state across machines
+
+By default a train lives only on the machine that created it, which is a
+problem if you work across several devboxes: you have to remember which box
+holds which train. Point choochoo at a git repo you own and it keeps the
+trains there instead, so any box sees all of them.
+
+Create a repo for it — **make it private**, since branch names, PR numbers and
+PR titles go in — then write `~/.config/choochoo/config.toml`:
+
+```toml
+[store]
+repo = "git@github.com:you/choochoo-state.git"
+branch = "main"   # optional, defaults to main
+```
+
+That's the whole setup. From then on:
+
+```bash
+# devbox 1
+choo init my-feature && choo add && choo push && choo pr
+
+# devbox 2 — the train is already there
+choo list
+choo fetch my-feature     # create the branches locally
+choo checkout feat/part-1
+```
+
+Trains you already had are moved into the store the first time it's used; the
+old `state.json` is renamed to `state.json.adopted` rather than deleted.
+
+### What is and isn't shared
+
+Trains are shared. **The active-train pointer is not** — which train *you* are
+working on is a property of the machine you're sitting at, so `choo switch` on
+one box doesn't move another box's pointer. It lives in
+`.git/choochoo/local.json`, alongside `rebase-progress.json`, which is also
+per-machine (a half-finished rebase means nothing in another working tree).
+
+Repositories are keyed by their `origin` URL, normalised so that
+`git@github.com:you/repo.git` and `https://github.com/You/Repo` are the same
+key. A repo with no `origin` can't be identified, and choochoo says so rather
+than guessing. Inside the store repo:
+
+```
+repos/github.com/you/repo.json
+```
+
+### Offline, and when two machines disagree
+
+Every command pulls before reading and pushes after writing, but neither is
+allowed to get in your way:
+
+* **Can't reach the store?** Reads fall back to the last copy synced to this
+  machine, with a warning. `choo list` works on a plane.
+* **Can't push?** The change is committed to the store clone, which is
+  durable, and published by your next command. You're told, and
+  `choo sync --status` will keep saying `unpublished: yes` until it lands.
+  The command itself doesn't fail — its actual work succeeded.
+* **Another machine pushed first?** choochoo re-reads, merges per-train, and
+  retries. A train created on the other box is never lost, because the merge
+  is at train granularity rather than a text diff.
+* **The same train edited on both machines?** The machine that publishes wins
+  and says so, naming the `git -C <clone> log -p` command that shows the other
+  version. Nothing is destroyed — the store is a git repo, so its history *is*
+  the recovery mechanism.
+
+`git merge` and `git pull` are never run inside the store clone: every write
+resets onto the remote tip and re-applies, so a *git* conflict there is
+impossible by construction. The only conflict that can happen is the semantic
+one above.
+
+If the store is genuinely unreachable and there's no clone yet, that's an
+error rather than a silent fallback — quietly showing you an empty list of
+trains would be worse.
+
 ## Mental model
 
-A **train** is just a name + a base branch + an ordered list of git branches
-stored in `.git/choochoo/state.json`. choochoo never invents commits or
+A **train** is just a name + a base branch + an ordered list of git branches,
+stored in `.git/choochoo/state.json`, or in your state repo when
+[sharing](#sharing-state-across-machines) is configured. choochoo never invents commits or
 moves branches behind your back — it always uses your local `git` for git
 operations and your local `gh` for GitHub operations. The one branch it does
 move on its own is the opt-in [combined branch](#the-combined-branch), which
@@ -151,6 +237,14 @@ The rebase algorithm is the standard stacked-rebase recipe:
 3. On conflict, leave you mid-rebase, persist progress under
    `.git/choochoo/rebase-progress.json`, and instruct you to run
    `choo rebase --continue` after resolution.
+
+Files choochoo keeps in `.git/choochoo/`:
+
+| File | What | Shared? |
+|---|---|---|
+| `state.json` | the trains, when sharing is off | no |
+| `local.json` | the active-train pointer | never |
+| `rebase-progress.json` | an interrupted rebase | never |
 
 `choo pr` is idempotent: it looks up existing PRs by head branch, only
 creates ones that don't exist yet, then re-renders every PR description so
@@ -212,13 +306,29 @@ cargo test
 Tests are hermetic — no network, no `gh` auth required:
 
 * **Unit tests** in every module exercise pure logic (state validation,
-  table rendering, list manipulation, rebase planning, the TUI app state
-  machine).
+  table rendering, list manipulation, rebase planning, remote-URL
+  normalisation, the three-way state merge, the TUI app state machine).
 * **Integration tests** under `tests/` run the real `choo` binary inside
   temporary `git init`'d repos — including `cli_aggregate.rs`, which checks
   the combined branch really does carry every file the train touches. The `pr` command is exercised against an
   in-process `FakeGh` selected by the `CHOOCHOO_GH_FAKE` environment
   variable, which records all calls in a JSON file the tests can read.
+
+Two things keep that true now that there's a config file and a remote store:
+
+* Unit tests build their store with `Store::local(tmpdir)` and resolve config
+  from an `Env` struct they construct literally, so they cannot read your real
+  `~/.config/choochoo/config.toml` and no test ever calls `std::env::set_var`
+  (which is process-global, and `cargo test` is multi-threaded).
+* Integration tests spawn the real binary, so `tests/common/mod.rs` pins
+  `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CHOOCHOO_CONFIG` and even
+  `GIT_CONFIG_GLOBAL` per child process.
+
+A bare repo in a tempdir stands in for GitHub — for the code repo *and* the
+state repo — so `cli_sync.rs` exercises real clone/fetch/commit/push, two
+"devboxes", the push race, offline degradation and the adoption path with no
+network at all. Forced push failures use a `pre-receive` hook rather than
+trying to win a race.
 
 To accept new snapshot output:
 
@@ -228,10 +338,11 @@ INSTA_UPDATE=always cargo test
 
 ## Limitations
 
-* **State is local-only.** `.git/choochoo/state.json` lives inside `.git/`
-  and isn't shared across machines or teammates. Bumping the schema's
-  `version` field is the migration path; sharing via `git notes` is a
-  future option.
+* **Sharing is opt-in, and it's for you, not your team.** With no config
+  file, state stays in `.git/choochoo/state.json` exactly as before.
+  Configuring `[store] repo` shares trains between *your* machines — it isn't
+  designed for several people editing one train at once (the last publisher
+  wins, loudly). See [Sharing state across machines](#sharing-state-across-machines).
 * **Conflicts aren't auto-resolved.** When `choo rebase` hits a conflict it
   hands off to you and waits for `choo rebase --continue`.
 * **GitHub-only.** Other forges (GitLab, Bitbucket) aren't supported.

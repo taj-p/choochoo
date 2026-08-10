@@ -1,16 +1,14 @@
 //! `choo remove` — drop a branch from a train. Does not delete the
 //! underlying git branch.
 
-use std::path::Path;
-
 use crate::error::{Error, Result};
-use crate::state::{self, Train};
+use crate::state::{Store, Train};
 
-pub fn run(repo_root: &Path, train_name: Option<&str>, branch: &str) -> Result<()> {
-    let mut state = state::load(repo_root)?;
+pub fn run(store: &Store, train_name: Option<&str>, branch: &str) -> Result<()> {
+    let mut state = store.load()?;
     let train_name = state.resolve_train_name(train_name)?.to_string();
     apply(state.train_mut(&train_name)?, branch)?;
-    state::save(repo_root, &state)
+    store.save(&state)
 }
 
 pub(crate) fn apply(train: &mut Train, branch: &str) -> Result<()> {

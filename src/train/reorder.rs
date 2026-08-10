@@ -1,9 +1,7 @@
 //! `choo move` — reposition a branch within a train.
 
-use std::path::Path;
-
 use crate::error::{Error, Result};
-use crate::state::{self, Train};
+use crate::state::{Store, Train};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
@@ -12,16 +10,16 @@ pub enum Position {
 }
 
 pub fn run(
-    repo_root: &Path,
+    store: &Store,
     train_name: Option<&str>,
     branch: &str,
     position: Position,
     relative_to: &str,
 ) -> Result<()> {
-    let mut state = state::load(repo_root)?;
+    let mut state = store.load()?;
     let name = state.resolve_train_name(train_name)?.to_string();
     apply(state.train_mut(&name)?, branch, position, relative_to)?;
-    state::save(repo_root, &state)
+    store.save(&state)
 }
 
 pub(crate) fn apply(

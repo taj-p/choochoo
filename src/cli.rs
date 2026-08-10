@@ -5,7 +5,6 @@
 //! (argument parsing, formatting, exit codes) live here.
 
 use std::io::{self, Write};
-use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
@@ -13,7 +12,7 @@ use crate::error::Result;
 use crate::git::{ProcessGitRunner, PushMode};
 use crate::github;
 use crate::report::StderrReporter;
-use crate::state;
+use crate::state::{self, Store};
 use crate::train;
 
 #[derive(Debug, Parser)]
@@ -21,6 +20,10 @@ use crate::train;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+    /// Don't touch the network for shared state: read the last-synced copy,
+    /// and commit any change locally to publish on your next synced command.
+    #[arg(long, global = true)]
+    pub no_sync: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,10 +85,27 @@ pub enum Command {
         train: Option<String>,
     },
     /// Check out a branch in a train.
+    ///
+    /// If the branch is in the train but not on this machine yet, it is
+    /// created from `<remote>/<branch>`.
     Checkout {
         branch: String,
         #[arg(short = 't', long = "train")]
         train: Option<String>,
+        /// Remote to create the branch from when it's missing locally.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Create local branches for every branch in a train, from the remote.
+    ///
+    /// Use this on a second machine: shared state tells you the train
+    /// exists, this puts its branches in your working copy. Branches you
+    /// already have are never moved, and your working tree stays put.
+    Fetch {
+        /// Train name. Defaults to the active train.
+        train: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
     },
     /// Restack the whole train.
     Rebase {
@@ -140,6 +160,16 @@ pub enum Command {
         #[command(subcommand)]
         action: AggregateCommand,
     },
+    /// Show where shared train state lives, and push anything pending.
+    ///
+    /// Every command already syncs; this is for checking the setup and for
+    /// draining a change that couldn't be published earlier (say, you were
+    /// offline when you ran `choo add`).
+    Sync {
+        /// Report only; don't contact the store.
+        #[arg(long)]
+        status: bool,
+    },
     /// Launch the interactive TUI.
     Tui,
 }
@@ -171,10 +201,31 @@ pub enum AggregateCommand {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let repo_root = state::find_repo_root(&std::env::current_dir()?)?;
-    dispatch(cli, &repo_root)
+
+    let mut env = crate::config::Env::from_process();
+    env.no_sync |= cli.no_sync;
+    let config = crate::config::load(&env)?;
+
+    // Only construct a git runner when the config actually needs one to
+    // identify this repo; a purely local `choo` shouldn't require `git` on
+    // PATH any earlier than it does today.
+    let store = if config.store().is_some() {
+        let git = ProcessGitRunner::new(repo_root.clone())?;
+        crate::store::open(&repo_root, &config, &env, &git)?
+    } else {
+        Store::local(repo_root)
+    };
+
+    let result = dispatch(cli, &store);
+    // Surface sync degradations even when the command itself failed — the
+    // reason a command failed may well be in here.
+    for warning in store.take_warnings() {
+        eprintln!("warning: {warning}");
+    }
+    result
 }
 
-pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
+pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cli.command {
@@ -184,13 +235,13 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
             aggregate,
             aggregate_branch,
         } => {
-            train::init::run(repo_root, &name, &base)?;
+            train::init::run(store, &name, &base)?;
             writeln!(&mut out, "created train `{name}` (base `{base}`)").ok();
             if aggregate || aggregate_branch.is_some() {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
                 let mut reporter = StderrReporter::new();
                 let branch = train::aggregate::enable(
-                    repo_root,
+                    store,
                     &git,
                     &mut reporter,
                     Some(&name),
@@ -200,24 +251,24 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
             }
         }
         Command::List => {
-            let s = train::show::run_list(repo_root)?;
+            let s = train::show::run_list(store)?;
             out.write_all(s.as_bytes()).ok();
         }
         Command::Show { name } => {
-            let s = train::show::run_show(repo_root, name.as_deref())?;
+            let s = train::show::run_show(store, name.as_deref())?;
             out.write_all(s.as_bytes()).ok();
         }
         Command::Switch { name } => {
-            train::switch::run(repo_root, &name)?;
+            train::switch::run(store, &name)?;
             writeln!(&mut out, "active train is now `{name}`").ok();
         }
         Command::Add { branch, train: t } => {
-            let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
-            train::add::run(repo_root, &git, t.as_deref(), branch.as_deref())?;
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
+            train::add::run(store, &git, t.as_deref(), branch.as_deref())?;
             writeln!(&mut out, "ok").ok();
         }
         Command::Remove { branch, train: t } => {
-            train::remove::run(repo_root, t.as_deref(), &branch)?;
+            train::remove::run(store, t.as_deref(), &branch)?;
             writeln!(&mut out, "removed `{branch}`").ok();
         }
         Command::Move {
@@ -236,25 +287,56 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                     ));
                 }
             };
-            train::reorder::run(repo_root, t.as_deref(), &branch, position, &relative_to)?;
+            train::reorder::run(store, t.as_deref(), &branch, position, &relative_to)?;
             writeln!(&mut out, "moved `{branch}`").ok();
         }
-        Command::Checkout { branch, train: t } => {
-            let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
-            train::checkout::run(repo_root, &git, t.as_deref(), &branch)?;
+        Command::Checkout {
+            branch,
+            train: t,
+            remote,
+        } => {
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
+            let mut reporter = StderrReporter::new();
+            train::checkout::run(
+                store,
+                &git,
+                &mut reporter,
+                t.as_deref(),
+                &branch,
+                &remote,
+            )?;
+        }
+        Command::Fetch { train: t, remote } => {
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
+            let mut reporter = StderrReporter::new();
+            let s =
+                train::fetch::run(store, &git, &mut reporter, t.as_deref(), &remote)?;
+            writeln!(
+                &mut out,
+                "train `{}`: created {}, already here {}{}",
+                s.train,
+                s.created.len(),
+                s.existing.len() + s.behind.len(),
+                if s.behind.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} behind `{remote}`)", s.behind.len())
+                }
+            )
+            .ok();
         }
         Command::Rebase {
             train: t,
             r#continue,
             abort,
         } => {
-            let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
             let mut reporter = StderrReporter::new();
             if abort {
-                train::rebase::abort(repo_root, &git)?;
+                train::rebase::abort(store, &git)?;
                 writeln!(&mut out, "rebase aborted").ok();
             } else if r#continue {
-                let s = train::rebase::continue_run(repo_root, &git, &mut reporter)?;
+                let s = train::rebase::continue_run(store, &git, &mut reporter)?;
                 writeln!(
                     &mut out,
                     "train `{}` rebased; continued for {} more branch(es)",
@@ -263,7 +345,7 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 )
                 .ok();
             } else {
-                let s = train::rebase::run(repo_root, &git, &mut reporter, t.as_deref())?;
+                let s = train::rebase::run(store, &git, &mut reporter, t.as_deref())?;
                 writeln!(
                     &mut out,
                     "train `{}` rebased ({} branch(es))",
@@ -288,10 +370,10 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 (false, true) => PushMode::Plain,
                 (true, true) => unreachable!("clap conflicts_with"),
             };
-            let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
             let mut reporter = StderrReporter::new();
             let s = train::push::run(
-                repo_root,
+                store,
                 &git,
                 &mut reporter,
                 t.as_deref(),
@@ -312,7 +394,7 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
         Command::Pr { train: t, draft } => {
             let gh = github::make_runner()?;
             let mut reporter = StderrReporter::new();
-            let s = train::pr::run(repo_root, gh.as_ref(), &mut reporter, t.as_deref(), draft)?;
+            let s = train::pr::run(store, gh.as_ref(), &mut reporter, t.as_deref(), draft)?;
             writeln!(
                 &mut out,
                 "train `{}`: created {}, updated {}",
@@ -327,10 +409,10 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
         }
         Command::Aggregate { action } => match action {
             AggregateCommand::Enable { branch, train: t } => {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
                 let mut reporter = StderrReporter::new();
                 let branch = train::aggregate::enable(
-                    repo_root,
+                    store,
                     &git,
                     &mut reporter,
                     t.as_deref(),
@@ -344,7 +426,7 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 .ok();
             }
             AggregateCommand::Disable { train: t } => {
-                let branch = train::aggregate::disable(repo_root, t.as_deref())?;
+                let branch = train::aggregate::disable(store, t.as_deref())?;
                 writeln!(
                     &mut out,
                     "combined branch `{branch}` no longer managed (branch and PR left as-is)"
@@ -352,9 +434,9 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 .ok();
             }
             AggregateCommand::Sync { train: t } => {
-                let git = ProcessGitRunner::new(repo_root.to_path_buf())?;
+                let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
                 let mut reporter = StderrReporter::new();
-                match train::aggregate::run_sync(repo_root, &git, &mut reporter, t.as_deref())? {
+                match train::aggregate::run_sync(store, &git, &mut reporter, t.as_deref())? {
                     Some(o) => {
                         writeln!(
                             &mut out,
@@ -371,8 +453,36 @@ pub fn dispatch(cli: Cli, repo_root: &Path) -> Result<()> {
                 }
             }
         },
+        Command::Sync { status } => {
+            if !store.is_shared() {
+                writeln!(
+                    &mut out,
+                    "trains are local to this machine ({})\n\
+                     configure `[store] repo` in your choochoo config to share them",
+                    store.describe()
+                )
+                .ok();
+            } else {
+                if !status {
+                    store.sync_now()?;
+                }
+                let state = store.load()?;
+                writeln!(&mut out, "shared state: {}", store.describe()).ok();
+                writeln!(&mut out, "trains:       {}", state.trains.len()).ok();
+                writeln!(
+                    &mut out,
+                    "unpublished:  {}",
+                    if store.has_unpublished() {
+                        "yes — retried on your next command"
+                    } else {
+                        "no"
+                    }
+                )
+                .ok();
+            }
+        }
         Command::Tui => {
-            crate::tui::run(repo_root)?;
+            crate::tui::run(store)?;
         }
     }
     Ok(())

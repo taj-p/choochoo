@@ -1,16 +1,14 @@
 //! `choo init` — create a new (empty) train.
 
-use std::path::Path;
-
 use crate::error::{Error, Result};
-use crate::state::{self, StateFile, Train};
+use crate::state::{StateFile, Store, Train};
 
 /// Create a new train with `name` based off `base`. If no train was active,
 /// the new train becomes active.
-pub fn run(repo_root: &Path, name: &str, base: &str) -> Result<()> {
-    let mut state = state::load(repo_root)?;
+pub fn run(store: &Store, name: &str, base: &str) -> Result<()> {
+    let mut state = store.load()?;
     apply(&mut state, name, base)?;
-    state::save(repo_root, &state)
+    store.save(&state)
 }
 
 pub(crate) fn apply(state: &mut StateFile, name: &str, base: &str) -> Result<()> {
