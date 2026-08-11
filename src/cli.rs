@@ -91,6 +91,9 @@ pub enum Command {
     /// If the branch is in the train but not on this machine yet, it is
     /// created from `<remote>/<branch>`.
     Checkout {
+        /// Branch name, the train's base, or a position in the train —
+        /// `choo checkout 1` takes the first branch, matching the `#`
+        /// column of the train table.
         branch: String,
         #[arg(short = 't', long = "train")]
         train: Option<String>,

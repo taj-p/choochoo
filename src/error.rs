@@ -45,6 +45,13 @@ pub enum Error {
     #[error("branch `{branch}` is not in train `{train}`")]
     BranchNotInTrain { train: String, branch: String },
 
+    #[error("train `{train}` has no branch at position {position}; positions run 1..={len}")]
+    NoBranchAtPosition {
+        train: String,
+        position: usize,
+        len: usize,
+    },
+
     #[error("branch `{branch}` is already in train `{train}`")]
     BranchAlreadyInTrain { train: String, branch: String },
 

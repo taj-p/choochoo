@@ -112,7 +112,7 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 | `choo add [<branch>] [-t <train>]` | Append a branch (default: current) to a train. |
 | `choo remove <branch> [-t <train>]` | Drop a branch from a train (does not delete the git branch). |
 | `choo move <branch> --before <other>` | Move a branch within a train. Use `--after` for the other direction. |
-| `choo checkout <branch> [-t <train>]` | Check out a branch in the train. |
+| `choo checkout <branch\|position> [-t <train>]` | Check out a branch in the train, by name or by position: `choo checkout 1` is the first branch, numbered as in the train table. |
 | `choo rebase [-t <train>]` | Restack the whole train onto the current base, then re-point the combined branch (if enabled). |
 | `choo rebase --continue` | Resume after resolving conflicts and running `git rebase --continue`. |
 | `choo rebase --abort` | Cancel an in-progress rebase. |

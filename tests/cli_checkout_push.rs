@@ -25,6 +25,29 @@ fn checkout_switches_branches() {
 }
 
 #[test]
+fn checkout_takes_a_position_in_the_train() {
+    let repo = TestRepo::new();
+    three_branch_train(&repo);
+    repo.choo_ok(["checkout", "2"]);
+    assert_eq!(repo.current_branch(), "b");
+    repo.choo_ok(["checkout", "1"]);
+    assert_eq!(repo.current_branch(), "a");
+}
+
+#[test]
+fn checkout_position_out_of_range_fails() {
+    let repo = TestRepo::new();
+    three_branch_train(&repo);
+    let out = repo.choo().args(["checkout", "3"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no branch at position 3"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn checkout_branch_not_in_train_fails() {
     let repo = TestRepo::new();
     repo.choo_ok(["init", "feat"]);
