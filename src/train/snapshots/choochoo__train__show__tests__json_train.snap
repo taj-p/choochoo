@@ -1,0 +1,33 @@
+---
+source: src/train/show.rs
+expression: "render_json(&s, \"feat\").unwrap()"
+---
+{
+  "name": "feat",
+  "base": "main",
+  "active": true,
+  "context": "Read from the bottom.",
+  "branches": [
+    {
+      "index": 1,
+      "branch": "a",
+      "parent": "main",
+      "pr": {
+        "number": 7,
+        "url": "https://example/pr/7",
+        "title": null
+      }
+    },
+    {
+      "index": 2,
+      "branch": "b",
+      "parent": "a",
+      "pr": null
+    }
+  ],
+  "aggregate": {
+    "branch": "choo/feat/combined",
+    "parent": "main",
+    "pr": null
+  }
+}

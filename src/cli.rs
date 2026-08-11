@@ -54,6 +54,11 @@ pub enum Command {
     Show {
         /// Train name. Defaults to the active train.
         name: Option<String>,
+        /// Print the train as JSON instead of prose, with each branch's
+        /// parent spelled out. For scripts: `dfh-train` reads this to open
+        /// every branch-vs-parent diff behind one URL.
+        #[arg(long)]
+        json: bool,
     },
     /// Set the active train.
     Switch {
@@ -309,8 +314,12 @@ pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
             let s = train::show::run_list(store)?;
             out.write_all(s.as_bytes()).ok();
         }
-        Command::Show { name } => {
-            let s = train::show::run_show(store, name.as_deref())?;
+        Command::Show { name, json } => {
+            let s = if json {
+                train::show::run_show_json(store, name.as_deref())?
+            } else {
+                train::show::run_show(store, name.as_deref())?
+            };
             out.write_all(s.as_bytes()).ok();
         }
         Command::Switch { name } => {

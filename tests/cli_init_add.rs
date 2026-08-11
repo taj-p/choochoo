@@ -146,6 +146,28 @@ fn add_explicit_branch_appends() {
 }
 
 #[test]
+fn show_json_chains_each_branch_to_its_parent() {
+    let repo = TestRepo::new();
+    repo.choo_ok(["init", "feat", "--base", "main", "--aggregate"]);
+    repo.branch("feature/a", "main");
+    repo.commit("a.txt");
+    repo.choo_ok(["add"]);
+    repo.branch("feature/b", "feature/a");
+    repo.commit("b.txt");
+    repo.choo_ok(["add"]);
+
+    let out = repo.choo_ok(["show", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["base"], "main");
+    assert_eq!(v["branches"][0]["branch"], "feature/a");
+    assert_eq!(v["branches"][0]["parent"], "main");
+    assert_eq!(v["branches"][1]["branch"], "feature/b");
+    assert_eq!(v["branches"][1]["parent"], "feature/a");
+    // The aggregate holds the whole train, so it diffs against the base.
+    assert_eq!(v["aggregate"]["parent"], "main");
+}
+
+#[test]
 fn add_unknown_branch_errors() {
     let repo = TestRepo::new();
     repo.choo_ok(["init", "feat"]);

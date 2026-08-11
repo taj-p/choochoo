@@ -2,13 +2,99 @@
 
 use std::fmt::Write;
 
+use serde::Serialize;
+
 use crate::error::Result;
-use crate::state::{StateFile, Store, Train};
+use crate::state::{PrInfo, StateFile, Store, Train};
 
 /// Render a one-train summary that goes to stdout.
 pub fn render_show(state: &StateFile, train_name: &str) -> Result<String> {
     let train = state.train(train_name)?;
     Ok(format_train(state, train))
+}
+
+/// Render one train as JSON, for scripts that drive other tools from the
+/// shape of a train — `dfh-train` starts one difit per `(parent, branch)`
+/// pair so a whole stack is reviewable behind a single URL.
+///
+/// Deliberately not [`Train`]'s own derived shape: that stores each branch's
+/// parent implicitly in `branches` order, and carries internals
+/// (`branch_bases`) that no consumer should build on. Here the parent is
+/// spelled out per branch, and `pr`/`aggregate` are always present — `null`
+/// rather than absent — so a consumer can test them without knowing which
+/// keys choochoo omits.
+pub fn render_json(state: &StateFile, train_name: &str) -> Result<String> {
+    let train = state.train(train_name)?;
+    let branches = train
+        .pairs()
+        .enumerate()
+        .map(|(i, (parent, branch))| BranchJson {
+            index: i + 1,
+            branch,
+            parent,
+            pr: train.prs.get(branch).map(PrJson::new),
+        })
+        .collect();
+    // The aggregate branch holds every change in the train, so its parent is
+    // the train's base rather than any branch in the stack.
+    let aggregate = train.aggregate.as_ref().map(|agg| AggregateJson {
+        branch: &agg.branch,
+        parent: &train.base,
+        pr: agg.pr.as_ref().map(PrJson::new),
+    });
+    let mut out = serde_json::to_string_pretty(&TrainJson {
+        name: &train.name,
+        base: &train.base,
+        active: state.active.as_deref() == Some(train.name.as_str()),
+        context: train.context(),
+        branches,
+        aggregate,
+    })?;
+    out.push('\n');
+    Ok(out)
+}
+
+#[derive(Serialize)]
+struct TrainJson<'a> {
+    name: &'a str,
+    base: &'a str,
+    active: bool,
+    context: Option<&'a str>,
+    branches: Vec<BranchJson<'a>>,
+    aggregate: Option<AggregateJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct BranchJson<'a> {
+    /// 1-based position in the stack, matching what `choo show` prints.
+    index: usize,
+    branch: &'a str,
+    parent: &'a str,
+    pr: Option<PrJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct AggregateJson<'a> {
+    branch: &'a str,
+    parent: &'a str,
+    pr: Option<PrJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct PrJson<'a> {
+    number: u64,
+    url: &'a str,
+    title: Option<&'a str>,
+}
+
+impl<'a> PrJson<'a> {
+    fn new(pr: &'a PrInfo) -> Self {
+        Self {
+            number: pr.number,
+            url: &pr.url,
+            title: pr.title.as_deref(),
+        }
+    }
 }
 
 /// Render the full list of trains.
@@ -102,6 +188,12 @@ pub fn run_show(store: &Store, train_name: Option<&str>) -> Result<String> {
     let state = store.load()?;
     let name = state.resolve_train_name(train_name)?;
     render_show(&state, name)
+}
+
+pub fn run_show_json(store: &Store, train_name: Option<&str>) -> Result<String> {
+    let state = store.load()?;
+    let name = state.resolve_train_name(train_name)?;
+    render_json(&state, name)
 }
 
 #[cfg(test)]
@@ -207,5 +299,28 @@ mod tests {
     fn show_unknown_train_errors() {
         let s = StateFile::default();
         assert!(render_show(&s, "ghost").is_err());
+    }
+
+    #[test]
+    fn json_spells_out_every_parent() {
+        let mut s = sample_state();
+        let t = s.train_mut("feat").unwrap();
+        t.aggregate = Some(crate::state::Aggregate::new("choo/feat/combined"));
+        t.set_context("Read from the bottom.");
+        insta::assert_snapshot!("json_train", render_json(&s, "feat").unwrap());
+    }
+
+    #[test]
+    fn json_nulls_the_aggregate_when_disabled() {
+        let s = sample_state();
+        let out = render_json(&s, "feat").unwrap();
+        assert!(out.contains("\"aggregate\": null"), "got: {out}");
+        assert!(out.contains("\"context\": null"), "got: {out}");
+    }
+
+    #[test]
+    fn json_unknown_train_errors() {
+        let s = StateFile::default();
+        assert!(render_json(&s, "ghost").is_err());
     }
 }
