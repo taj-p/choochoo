@@ -27,7 +27,17 @@
 //!   ([`crate::state::Train::branch_bases`]), the commit its own commits sit
 //!   directly on. Exact by construction, and the only option that survives a
 //!   mid-stack history rewrite. Used only when [`trusted_bases`] confirms it's
-//!   still an ancestor of the child.
+//!   still an ancestor of the child — and even then, only after checking
+//!   whether the parent's *live* tip is a better answer. That check catches a
+//!   case being merely an ancestor doesn't: the parent (say the train's base)
+//!   fast-forwards, `choo rebase` records the child's base as that tip, and
+//!   the user then rebases the child onto the *next* fast-forward by hand
+//!   instead of running `choo rebase` again. The stale recorded base is still
+//!   technically an ancestor of the child (a fast-forward never stops being
+//!   one), so a plain ancestor check would keep trusting it — and replay
+//!   every commit the parent picked up in between as if it were the child's
+//!   own work, right back onto the parent that already has it. See
+//!   [`trusted_bases`] for the self-healing check that fixes this.
 //! - [`BoundarySource::Snapshot`] — the parent's tip from step 1. This is only
 //!   a *proxy* for the boundary: it's the right commit as long as the child is
 //!   still parented on it, which stops being true the moment someone amends or
@@ -183,22 +193,54 @@ pub fn build_plan(
     Ok(plan)
 }
 
-/// Filter the train's recorded bases down to the ones we're willing to act on:
-/// still an ancestor of the branch they describe.
+/// Filter the train's recorded bases down to the ones we're willing to act on,
+/// self-healing a stale entry whenever the live repo already proves a better
+/// answer.
 ///
-/// That single check covers both ways an entry goes bad. A base that's no
-/// longer an ancestor means the branch was rewritten out from under it; a base
-/// git can't resolve at all — garbage-collected, or synced from a machine whose
-/// commits this one has never fetched — also answers "no". Either way the pair
-/// falls back to snapshot semantics rather than failing.
+/// A recorded base is used only once it passes the base case both ways
+/// already required — still an ancestor of the child it describes — and then,
+/// on top of that, one more check decides *which* commit to hand back:
+///
+/// - **Self-heal**: the recorded base is also an ancestor of the parent's
+///   *live* tip, and the child already sits on top of that live tip. That
+///   combination means the parent has advanced past the recorded base (an
+///   ordinary fast-forward, not a rewrite) *and* the child has already been
+///   carried at least that far — which choochoo can only observe after the
+///   fact, since the only way to get there is something outside choochoo,
+///   most commonly a manual `git rebase`. The parent's live tip is then the
+///   child's true base, and using it instead of the stale recorded value is
+///   what avoids replaying the parent's own history back onto itself (see the
+///   module doc for the bug this exists to fix).
+/// - **Recorded, unchanged**: any other case where the base is still an
+///   ancestor of the child. Covers the ordinary "nothing happened, base is
+///   just older" case (self-heal picks the same commit anyway there), the
+///   mid-stack-amend case (the parent's live tip is a rewrite unrelated to the
+///   recorded base, so the first self-heal condition fails), and a reordered
+///   train (`choo move`): the "parent" here can be an earlier, unrelated
+///   ancestor of the child rather than the commit the child's own work
+///   actually starts from, and the recorded base is not itself an ancestor of
+///   that earlier commit, so self-heal correctly declines.
+///
+/// A base git can't resolve at all — garbage-collected, or synced from a
+/// machine whose commits this one has never fetched — answers "no" to the
+/// ancestor check like any other stale base, and the pair falls back to
+/// snapshot semantics rather than failing.
 fn trusted_bases(git: &dyn GitRunner, train: &Train) -> Result<BTreeMap<String, String>> {
     let mut trusted = BTreeMap::new();
-    for branch in &train.branches {
-        if let Some(base) = train.branch_base(branch) {
-            if git.is_ancestor(base, branch)? {
-                trusted.insert(branch.clone(), base.to_string());
-            }
+    for (parent, child) in train.pairs() {
+        let Some(base) = train.branch_base(child) else {
+            continue;
+        };
+        if !git.is_ancestor(base, child)? {
+            continue;
         }
+        let live_parent_tip = git.rev_parse(parent)?;
+        let healed = git.is_ancestor(base, &live_parent_tip)?
+            && git.is_ancestor(&live_parent_tip, child)?;
+        trusted.insert(
+            child.to_string(),
+            if healed { live_parent_tip } else { base.to_string() },
+        );
     }
     Ok(trusted)
 }
@@ -758,6 +800,41 @@ mod tests {
         // the orphaned `a` component is gone, not duplicated as "M+a2+a+b".
         assert_eq!(git.rev_parse("b").unwrap(), "M+a2+b");
         assert_eq!(git.rev_parse("c").unwrap(), "M+a2+b+c");
+    }
+
+    /// The regression test for the "old master commit gets replayed onto the
+    /// first PR" bug: the base fast-forwards, `choo rebase` records the
+    /// child's base as that tip, and the user then rebases the child onto the
+    /// *next* fast-forward by hand instead of running `choo rebase` again.
+    #[test]
+    fn externally_rebased_first_branch_self_heals_its_base() {
+        let (_tmp, store, git, _) = fake_repo();
+        set_bases(&store, &[("a", "M"), ("b", "M+a"), ("c", "M+a+b")]);
+        advance_main(&git); // simulates a fetch after the first `choo rebase`
+        // Simulate `git rebase origin/master a` run by hand: `a` now sits on
+        // the new main tip, but its recorded base is still the stale `M`.
+        git.tips.borrow_mut().insert("a".into(), "M+z+a".into());
+
+        run(&store, &git, &mut NullReporter, None).unwrap();
+
+        let calls = git.rebase_calls.borrow().clone();
+        // Without self-healing, `a`'s stale recorded base `M` is still an
+        // ancestor of its new tip (main only fast-forwarded), so it would
+        // stay "trusted" and widen the replay range to `M..a` — which now
+        // includes the `z` commit main picked up, doubling it up when
+        // replayed onto main's live tip. Self-healing uses main's live tip
+        // (`M+z`) instead, since `a` already sits on top of it.
+        assert_eq!(calls[0], ("a".into(), "M+z".into(), "M+z".into()));
+        // `b` and `c`, never touched by hand, ride the ordinary recorded-base
+        // mechanism and pick up exactly their own commits.
+        assert_eq!(calls[1], ("b".into(), "M+z+a".into(), "M+a".into()));
+        assert_eq!(calls[2], ("c".into(), "M+z+a+b".into(), "M+a+b".into()));
+        assert_eq!(git.rev_parse("c").unwrap(), "M+z+a+b+c");
+
+        // The self-healed value is what gets recorded as `a`'s base going
+        // forward, replacing the stale `M`.
+        let state = store.load().unwrap();
+        assert_eq!(state.train("t").unwrap().branch_base("a"), Some("M+z"));
     }
 
     #[test]
