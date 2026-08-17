@@ -15,6 +15,7 @@ pub mod context;
 pub mod fetch;
 pub mod init;
 pub mod pr;
+pub mod pull;
 pub mod push;
 pub mod rebase;
 pub mod remove;

@@ -284,6 +284,17 @@ mod tests {
             self.tips.borrow_mut().insert(branch.to_string(), target);
             Ok(())
         }
+        fn fast_forward_current(&self, _t: &str) -> Result<()> {
+            // The aggregate branch is re-pointed with `git branch -f`; it is
+            // never the checked-out branch's business.
+            unreachable!()
+        }
+        fn reset_hard_current(&self, _t: &str) -> Result<()> {
+            unreachable!("only `choo pull --reset` resets")
+        }
+        fn is_dirty(&self) -> Result<bool> {
+            Ok(false)
+        }
         fn push(&self, _b: &str, _m: PushMode, _r: &str) -> Result<()> {
             Ok(())
         }

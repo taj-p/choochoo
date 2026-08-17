@@ -195,6 +195,17 @@ mod tests {
         fn set_branch(&self, _b: &str, _t: &str) -> Result<()> {
             Ok(())
         }
+        fn fast_forward_current(&self, _t: &str) -> Result<()> {
+            // `choo fetch` never moves a branch that's already here — that's
+            // `choo pull`'s job.
+            unreachable!()
+        }
+        fn reset_hard_current(&self, _t: &str) -> Result<()> {
+            unreachable!("only `choo pull --reset` resets")
+        }
+        fn is_dirty(&self) -> Result<bool> {
+            Ok(false)
+        }
         fn push(&self, _b: &str, _m: PushMode, _r: &str) -> Result<()> {
             Ok(())
         }

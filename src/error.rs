@@ -79,6 +79,12 @@ pub enum Error {
         remote: String,
     },
 
+    #[error(
+        "`{branch}` is checked out and has uncommitted changes that \
+         `--reset` would discard; commit or stash them first"
+    )]
+    DirtyWorkingTree { branch: String },
+
     #[error("no active train; pass --train or run `choo switch <name>`")]
     NoActiveTrain,
 

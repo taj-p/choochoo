@@ -72,7 +72,7 @@ choo context
 choo pr
 
 # Rebase the whole train when `main` advances.
-git fetch origin && git checkout main && git pull
+choo pull                      # fast-forwards the base and any stale branch
 choo rebase
 
 # Push the entire stack.
@@ -124,6 +124,7 @@ choo aggregate disable   # stop managing it (branch and PR are left alone)
 | `choo aggregate disable [-t <train>]` | Stop managing it. The git branch and its PR are left untouched. |
 | `choo aggregate sync [-t <train>]` | Re-point the combined branch at the train's current tip. |
 | `choo fetch [<train>] [--remote origin]` | Create a local tracking branch for every branch in the train that isn't here yet. Use it on a second machine. |
+| `choo pull [<train>] [--remote origin] [--reset]` | Fetch, then fast-forward every branch in the train — its base included — that the remote is strictly ahead of. Branches missing here are created, as `choo fetch` would. `--reset` additionally takes the remote's version of any branch that has *diverged*, for when another machine rebased the train and force-pushed it. See [Pulling a train](#pulling-a-train). |
 | `choo sync [--status]` | Show where shared state lives and publish anything pending. `--status` reports without touching the network. |
 | `choo tui` | Launch the interactive UI. |
 
@@ -189,6 +190,83 @@ A few properties worth knowing:
 * `choo context --show` prints the stored text, and `choo show` includes it in
   the train summary.
 
+## Pulling a train
+
+`choo pull` is the "catch this stack up" command: one fetch, then every
+branch in the train that the remote is strictly ahead of is fast-forwarded
+to it — the train's base and combined branch included.
+
+```bash
+choo pull                 # the active train, from `origin`
+choo pull my-feature      # a named train
+choo pull --remote upstream
+choo pull && choo rebase  # `main` moved: catch up, then restack
+```
+
+It replaces the loop you'd otherwise type by hand (`git checkout <branch> &&
+git pull`, once per branch), and the last line above is the whole reason it
+exists: `choo rebase` restacks the train onto its base, and the base has to
+be current for that to mean anything.
+
+What it will and won't do:
+
+* **Fast-forwards only.** A branch moves only when the remote is strictly
+  ahead of it, so no local commit is ever lost and no merge commit is ever
+  made.
+* **A diverged branch is reported and left alone** — that's every branch of
+  a train you rebased locally but haven't pushed yet. `choo pull` names
+  them and stops there; `choo rebase` is the command that rewrites history,
+  `choo push` is the one that makes the remote match you, and
+  [`choo pull --reset`](#when-another-machine-force-pushed) is the one that
+  makes you match the remote.
+* **A branch that's merely ahead** (unpushed work) is left alone too, and
+  isn't flagged — there's nothing to pull.
+* **Your working tree stays where it is.** Branches are moved without being
+  checked out, so pulling a ten-branch train doesn't take you off the one
+  you're editing. The exception is the branch you're *on*: it's
+  fast-forwarded with `git merge --ff-only`, which brings the tree along
+  (and fails, rather than overwriting anything, if the tree is dirty).
+* **Branches you don't have are created**, exactly as `choo fetch` does, so
+  on a second machine `choo pull` alone is enough. As with `choo fetch`, a
+  branch the train names but nobody ever pushed is an error — after
+  everything else has been updated.
+
+### When another machine force-pushed
+
+Fast-forward-only has one awkward consequence, and for this tool it's the
+common case rather than a corner. When your other devbox runs
+`choo rebase && choo push`, every branch in the train is rewritten — so from
+here every branch looks *diverged*, and a plain `choo pull` updates the base
+and declines the rest. The rewrite is exactly what you wanted, but pull
+can't tell it apart from unpushed local work: both are "I have commits the
+remote doesn't".
+
+`choo pull --reset` resolves it in the remote's favour:
+
+```bash
+choo pull --reset          # the other box is the source of truth
+```
+
+Diverged branches are hard-reset onto `<remote>/<branch>`. It's a flag and
+not a default because only you know which side is the truth. Three things
+bound it:
+
+* **Diverged branches only.** A branch that is merely *ahead* — local
+  commits with no rewrite behind them — is skipped and listed, so a mistyped
+  `--reset` can't delete work that exists nowhere else.
+* **It won't run over uncommitted changes.** If the branch it would reset is
+  the one you're on and the tree is dirty, the command stops *before* moving
+  anything, rather than half-way through the train. (Untracked files don't
+  count — `git reset --hard` doesn't touch them.)
+* **Nothing is unrecoverable.** Discarded commits stay in the reflog, and
+  the summary tells you how many and where to look:
+
+```text
+train `my-feature`: updated 1, reset 2, created 0, already current 0
+took `origin`'s version of: feat/part-1 (-1), feat/part-2 (-1)
+2 local commit(s) discarded — still in the reflog (`git reflog <branch>`)
+```
+
 ## TUI keys
 
 | Key | Action |
@@ -233,6 +311,9 @@ choo init my-feature && choo add && choo push && choo pr
 choo list
 choo fetch my-feature     # create the branches locally
 choo checkout feat/part-1
+
+# ...and later, once devbox 1 has pushed more
+choo pull my-feature      # fast-forward what's already here
 ```
 
 Trains you already had are moved into the store the first time it's used; the

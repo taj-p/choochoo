@@ -228,6 +228,16 @@ mod tests {
             self.tips.borrow_mut().insert(branch.to_string(), target);
             Ok(())
         }
+        fn fast_forward_current(&self, _t: &str) -> Result<()> {
+            // Pushing never moves a local branch.
+            unreachable!()
+        }
+        fn reset_hard_current(&self, _t: &str) -> Result<()> {
+            unreachable!("only `choo pull --reset` resets")
+        }
+        fn is_dirty(&self) -> Result<bool> {
+            Ok(false)
+        }
         fn rebase_onto(
             &self,
             _b: &str,

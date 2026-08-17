@@ -117,6 +117,31 @@ pub enum Command {
         #[arg(long, default_value = "origin")]
         remote: String,
     },
+    /// Update the train's local branches from the remote.
+    ///
+    /// Fetches, then fast-forwards every branch in the train — its base
+    /// included — that the remote is strictly ahead of. Branches that have
+    /// diverged (any train you've rebased locally) are reported and left
+    /// alone; nothing local is ever overwritten. Branches missing here are
+    /// created, as `choo fetch` would.
+    ///
+    /// Pass `--reset` when another machine rebased the train and
+    /// force-pushed it: diverged branches are then hard-reset onto the
+    /// remote instead of being reported. Branches that merely hold
+    /// unpushed commits are still left alone, and a dirty working tree on
+    /// a branch that would be reset stops the command before anything
+    /// moves.
+    Pull {
+        /// Train name. Defaults to the active train.
+        train: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Take the remote's version of any branch that has diverged,
+        /// discarding local commits it doesn't have. They stay in the
+        /// branch's reflog.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Restack the whole train.
     Rebase {
         #[arg(short = 't', long = "train")]
@@ -388,6 +413,76 @@ pub fn dispatch(cli: Cli, store: &Store) -> Result<()> {
                 }
             )
             .ok();
+        }
+        Command::Pull {
+            train: t,
+            remote,
+            reset,
+        } => {
+            let git = ProcessGitRunner::new(store.repo_root().to_path_buf())?;
+            let mut reporter = StderrReporter::new();
+            let s = train::pull::run(
+                store,
+                &git,
+                &mut reporter,
+                t.as_deref(),
+                &remote,
+                reset,
+            )?;
+            let was_reset = s.reset();
+            writeln!(
+                &mut out,
+                "train `{}`: updated {}, {}created {}, already current {}",
+                s.train,
+                s.updated(),
+                if reset {
+                    format!("reset {}, ", was_reset.len())
+                } else {
+                    String::new()
+                },
+                s.created(),
+                s.up_to_date()
+            )
+            .ok();
+            if !was_reset.is_empty() {
+                let discarded: u32 = was_reset.iter().map(|(_, n)| n).sum();
+                writeln!(
+                    &mut out,
+                    "took `{remote}`'s version of: {}\n\
+                     {discarded} local commit(s) discarded — still in the \
+                     reflog (`git reflog <branch>`)",
+                    was_reset
+                        .iter()
+                        .map(|(b, n)| format!("{b} (-{n})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .ok();
+            }
+            // Only worth saying under `--reset`: without it, "nothing to
+            // pull" is all there was to report about these.
+            let kept = s.kept_ahead();
+            if reset && !kept.is_empty() {
+                writeln!(
+                    &mut out,
+                    "not reset (unpushed local commits, nothing to compare \
+                     against): {}",
+                    kept.join(", ")
+                )
+                .ok();
+            }
+            let diverged = s.diverged();
+            if !diverged.is_empty() {
+                writeln!(
+                    &mut out,
+                    "left alone (diverged from `{remote}`): {}\n\
+                     run `choo rebase` to restack them, `choo push` if yours \
+                     is the version to keep, or `choo pull --reset` to take \
+                     `{remote}`'s",
+                    diverged.join(", ")
+                )
+                .ok();
+            }
         }
         Command::Rebase {
             train: t,

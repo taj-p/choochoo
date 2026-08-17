@@ -88,6 +88,31 @@ pub trait GitRunner {
     /// tree, so it fails when `branch` is the currently checked-out branch
     /// and would have to move.
     fn set_branch(&self, branch: &str, to_rev: &str) -> Result<()>;
+    /// Fast-forward the *currently checked out* branch to `to_rev`, moving
+    /// the working tree with it. Equivalent to `git merge --ff-only
+    /// <to_rev>`.
+    ///
+    /// The companion to [`GitRunner::set_branch`], which is the right tool
+    /// for every branch that *isn't* checked out and deliberately refuses
+    /// the one that is. Git does the refusing here too: this fails rather
+    /// than merging when `to_rev` isn't a descendant, and fails rather than
+    /// overwriting when the working tree is dirty.
+    fn fast_forward_current(&self, to_rev: &str) -> Result<()>;
+    /// Move the *currently checked out* branch to `to_rev`, working tree and
+    /// index with it. Equivalent to `git reset --hard <to_rev>`.
+    ///
+    /// Unlike [`GitRunner::fast_forward_current`] this discards whatever it
+    /// has to — commits and uncommitted changes both — without asking, so
+    /// callers own the decision that it's safe. Untracked files survive, as
+    /// they do under plain `git reset --hard`.
+    fn reset_hard_current(&self, to_rev: &str) -> Result<()>;
+    /// Whether the working tree or index has changes to *tracked* files.
+    ///
+    /// Untracked files deliberately don't count: they're what
+    /// [`GitRunner::reset_hard_current`] leaves alone, so treating a stray
+    /// scratch file as "dirty" would block a reset that couldn't have
+    /// harmed it.
+    fn is_dirty(&self) -> Result<bool>;
     fn push(&self, branch: &str, mode: PushMode, remote: &str) -> Result<()>;
     /// Push several branches to `remote` in a *single* `git push`.
     ///
@@ -347,6 +372,21 @@ impl GitRunner for ProcessGitRunner {
         }
         self.run(["branch", "--force", branch, &target])?;
         Ok(())
+    }
+
+    fn fast_forward_current(&self, to_rev: &str) -> Result<()> {
+        self.run(["merge", "--ff-only", to_rev])?;
+        Ok(())
+    }
+
+    fn reset_hard_current(&self, to_rev: &str) -> Result<()> {
+        self.run(["reset", "--hard", to_rev])?;
+        Ok(())
+    }
+
+    fn is_dirty(&self) -> Result<bool> {
+        let out = self.run(["status", "--porcelain", "--untracked-files=no"])?;
+        Ok(!out.trim().is_empty())
     }
 
     fn push(&self, branch: &str, mode: PushMode, remote: &str) -> Result<()> {

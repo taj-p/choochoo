@@ -624,6 +624,16 @@ mod tests {
             self.tips.borrow_mut().insert(branch.to_string(), target);
             Ok(())
         }
+        fn fast_forward_current(&self, _t: &str) -> Result<()> {
+            // Rebasing moves branches with `rebase --onto`, never a merge.
+            unreachable!()
+        }
+        fn reset_hard_current(&self, _t: &str) -> Result<()> {
+            unreachable!("only `choo pull --reset` resets")
+        }
+        fn is_dirty(&self) -> Result<bool> {
+            Ok(false)
+        }
         fn push(&self, _b: &str, _m: crate::git::PushMode, _r: &str) -> Result<()> {
             Ok(())
         }
